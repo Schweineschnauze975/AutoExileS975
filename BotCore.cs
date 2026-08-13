@@ -586,7 +586,7 @@ namespace AutoExile
 
             // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
-            _navigation.MoveKey = primaryMove?.Key.Value ?? Keys.T;
+            _navigation.MoveKey = primaryMove?.Key.Value ?? Keys.None;
 
             // Ensure skill bar is always up to date — NavigationSystem needs MovementSkills
             // for dash-for-speed even when combat is disabled by the active mode

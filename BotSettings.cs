@@ -164,7 +164,7 @@ namespace AutoExile
             // One slot should be PrimaryMovement (your Move Only key).
             // Movement skills (dash/blink) use the MovementSkill role.
 
-            public SkillSlotConfig Skill1 { get; set; } = new SkillSlotConfig(Keys.T, SkillRole.PrimaryMovement);
+            public SkillSlotConfig Skill1 { get; set; } = new SkillSlotConfig(Keys.T, SkillRole.Enemy);
             public SkillSlotConfig Skill2 { get; set; } = new SkillSlotConfig(Keys.Q);
             public SkillSlotConfig Skill3 { get; set; } = new SkillSlotConfig(Keys.W);
             public SkillSlotConfig Skill4 { get; set; } = new SkillSlotConfig(Keys.E);

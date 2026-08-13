@@ -347,6 +347,7 @@ namespace AutoExile.Systems
             BestTargetHasLOS = false;
             _skillBar.Clear();
             _primaryMovementEntry = null;
+            PrimaryMoveKey = null;
             _movementSkillEntries.Clear();
             PrimaryMoveKey = null;
             MovementSkills.Clear();
@@ -468,12 +469,14 @@ namespace AutoExile.Systems
 
                 if (!entity.IsAlive) continue;
 
+                var closeUniqueOverride = entity.Rarity == MonsterRarity.Unique && dist <= 18f;
+
                 // Track dormant monsters (alive + hostile but not targetable yet).
                 // Map bosses need proximity to activate. Track nearest for approach navigation.
                 // Skip entities whose paths match the learned ignore list (critters, volatiles, etc.).
                 // Also validate the entity has a readable Life component — stale entity references
                 // from zone transitions can report IsAlive=true from garbage memory.
-                if (!entity.IsTargetable)
+                if (!entity.IsTargetable && !closeUniqueOverride)
                 {
                     if (dist < nearestDormantDist && dist < combatRange && entity.Path != null)
                     {
@@ -525,7 +528,7 @@ namespace AutoExile.Systems
                     if (pathBlocked) continue;
                 }
 
-                var closeCombatOverride = entity.IsTargetable && dist <= 18f;
+                var closeCombatOverride = (entity.IsTargetable || closeUniqueOverride) && dist <= 18f;
 
                 // Skip monsters blacklisted as unreachable (attacks don't connect).
                 // A targetable monster standing on top of the player must be retried:
@@ -826,6 +829,9 @@ namespace AutoExile.Systems
                 // PrimaryMovement doesn't need an ActorSkill match — it's just a key
                 if (role == SkillRole.PrimaryMovement)
                 {
+                    if (PrimaryMoveKey != null)
+                        continue;
+
                     _primaryMovementEntry = new SkillBarEntry
                     {
                         Skill = null,
@@ -1848,7 +1854,13 @@ namespace AutoExile.Systems
                 absPos = new Vector2(windowRect.X + edgePoint.X, windowRect.Y + edgePoint.Y);
             }
 
-            var moveKey = PrimaryMoveKey ?? Keys.T;
+            var moveKey = PrimaryMoveKey ?? Keys.None;
+            if (moveKey == Keys.None)
+            {
+                LastAction = "move skipped: primary movement key not configured";
+                return;
+            }
+
             // Use continuous movement when available, fall back to pulse for compatibility
             if (BotInput.IsMovementActive && !BotInput.IsMovementSuspended)
                 BotInput.UpdateMovementCursor(absPos);
@@ -1999,6 +2011,24 @@ namespace AutoExile.Systems
             _ignoredDormantPaths.Clear();
             _ignoredDormantPaths.Add("Critters/");
             LearnedDormantIgnoreCount = 0;
+        }
+
+        /// <summary>
+        /// Clear temporary penalties for a single target that is clearly in combat range.
+        /// Simulacrum bosses can phase or stall HP updates without actually being unreachable.
+        /// </summary>
+        public void ForgetTargetPenalties(long targetId)
+        {
+            _unreachableMonsters.Remove(targetId);
+            _deprioritizedTargets.Remove(targetId);
+            _targetFocusStart.Remove(targetId);
+
+            if (_lastAttackTargetId == targetId)
+            {
+                _lastAttackTargetId = 0;
+                _lastAttackTargetHp = -1f;
+                _attackConnectivityStart = DateTime.Now;
+            }
         }
 
         // ═══════════════════════════════════════════════════

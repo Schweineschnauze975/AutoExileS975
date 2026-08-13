@@ -79,6 +79,9 @@ namespace AutoExile.Modes
         private const float PatrolRetargetSeconds = 3f;
         private DateTime _lastCloseCombatReadyRecovery = DateTime.MinValue;
         private const float CloseCombatReadyRecoverySeconds = 1.5f;
+        private DateTime _lastCloseUniqueCombatLock = DateTime.MinValue;
+        private const float CloseUniqueCombatLockDistance = 22f;
+        private const float CloseUniquePenaltyResetSeconds = 1.5f;
 
         // Action cooldown
         private const float MajorActionCooldownMs = 500f;
@@ -109,6 +112,7 @@ namespace AutoExile.Modes
             _patrolIndex = 0;
             _lastPatrolTargetAt = DateTime.MinValue;
             _lastCloseCombatReadyRecovery = DateTime.MinValue;
+            _lastCloseUniqueCombatLock = DateTime.MinValue;
 
             // Enable combat
             ModeHelpers.EnableDefaultCombat(ctx);
@@ -181,6 +185,13 @@ namespace AutoExile.Modes
                     ctx.Combat.SuppressTargetedSkills = ctx.Interaction.IsBusy;
                     ctx.Combat.Tick(ctx);
                 }
+
+                if (_state.IsWaveActive && combatAllowed && TryCloseUniqueCombatLock(ctx, gc.Player.GridPosNum))
+                {
+                    _phase = SimPhase.WaveCycle;
+                    _phaseStartTime = DateTime.Now;
+                    return;
+                }
             }
 
             // Tick interaction system
@@ -245,6 +256,7 @@ namespace AutoExile.Modes
             ModeHelpers.CancelAllSystems(ctx);
             _hideoutFlow.Cancel();
             _isStashing = false;
+            ResetTransientCombatState(ctx);
 
             if (gc.Area.CurrentArea.IsHideout || gc.Area.CurrentArea.IsTown)
             {
@@ -316,6 +328,7 @@ namespace AutoExile.Modes
                 _lootTracker.ResetCount();
                 _patrolIndex = 0;
                 _lastPatrolTargetAt = DateTime.MinValue;
+                ResetTransientCombatState(ctx);
                 StatusText = "Entered map — finding monolith";
             }
         }
@@ -498,6 +511,7 @@ namespace AutoExile.Modes
                 _waveStartAttempts = 0;
                 _betweenWaveStartTime = DateTime.MinValue;
                 _lastCloseCombatReadyRecovery = DateTime.MinValue;
+                _lastCloseUniqueCombatLock = DateTime.MinValue;
             }
 
             // --- Priority 0: Don't interrupt active loot pickup ---
@@ -554,6 +568,9 @@ namespace AutoExile.Modes
                 // NearbyMonsterCount = within CombatRange — monsters close enough to fight
                 if (ctx.Combat.NearbyMonsterCount > 0)
                 {
+                    if (TryCloseUniqueCombatLock(ctx, playerPos))
+                        return;
+
                     // Combat stuck detection: if monster count isn't decreasing, we're
                     // probably fighting unreachable/unkillable monsters — move on
                     if (_combatEngageTime == DateTime.MinValue || ctx.Combat.NearbyMonsterCount < _combatEngageCount)
@@ -781,6 +798,73 @@ namespace AutoExile.Modes
         /// Find and navigate to monsters when none are in chase range.
         /// Three-tier fallback: cached distant monsters → reset exploration and explore → orbit monolith.
         /// </summary>
+        private void ResetTransientCombatState(BotContext ctx)
+        {
+            _wasSearching = false;
+            _combatEngageTime = DateTime.MinValue;
+            _combatEngageCount = 0;
+            _blacklistedMonsters.Clear();
+            _lastCloseCombatReadyRecovery = DateTime.MinValue;
+            _lastCloseUniqueCombatLock = DateTime.MinValue;
+            ctx.Exploration.SeenRadiusOverride = 0;
+            ctx.Combat.ClearUnreachable();
+            ctx.Navigation.Stop(ctx.Game);
+            BotInput.StopMovement();
+        }
+
+        private bool TryCloseUniqueCombatLock(BotContext ctx, Vector2 playerPos)
+        {
+            var gc = ctx.Game;
+            var target = ctx.Combat.BestTarget;
+            var targetDist = target != null ? Vector2.Distance(playerPos, target.GridPosNum) : float.MaxValue;
+
+            if (target == null ||
+                target.Rarity != MonsterRarity.Unique ||
+                !target.IsAlive ||
+                !target.IsHostile ||
+                targetDist > CloseUniqueCombatLockDistance)
+            {
+                target = null;
+                targetDist = float.MaxValue;
+                foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+                {
+                    if (entity.Type != EntityType.Monster ||
+                        entity.Rarity != MonsterRarity.Unique ||
+                        !entity.IsAlive ||
+                        !entity.IsHostile)
+                        continue;
+
+                    var distToUnique = Vector2.Distance(playerPos, entity.GridPosNum);
+                    if (distToUnique > CloseUniqueCombatLockDistance || distToUnique >= targetDist)
+                        continue;
+
+                    target = entity;
+                    targetDist = distToUnique;
+                }
+            }
+
+            if (target == null)
+                return false;
+
+            ctx.Navigation.Stop(gc);
+            BotInput.StopMovement();
+            _wasSearching = false;
+            ctx.Exploration.SeenRadiusOverride = 0;
+            _combatEngageTime = DateTime.MinValue;
+            _combatEngageCount = 0;
+
+            if ((DateTime.Now - _lastCloseUniqueCombatLock).TotalSeconds >= CloseUniquePenaltyResetSeconds)
+            {
+                _lastCloseUniqueCombatLock = DateTime.Now;
+                ctx.Combat.ForgetTargetPenalties(target.Id);
+            }
+
+            var name = string.IsNullOrWhiteSpace(target.RenderName) ? "unique" : target.RenderName;
+            Decision = $"Wave {_state.CurrentWave} - close unique combat lock: {name} dist {targetDist:F0}, skill {ctx.Combat.LastSkillAction}";
+            StatusText = $"Wave {_state.CurrentWave}/15 - holding on boss ({targetDist:F0})";
+            return true;
+        }
+
         private void TickExploreForMonsters(BotContext ctx)
         {
             var gc = ctx.Game;

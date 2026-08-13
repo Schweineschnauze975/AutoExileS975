@@ -1207,7 +1207,7 @@ function autoClassifySkill(d) {
 // Determine type from existing config (reverse-map Role+conditions → type)
 function typeFromConfig(prefix) {
   const role = S[prefix+'.role']?.value || 'Disabled';
-  if (role === 'Disabled') return null; // no config → auto-detect
+  if (role === 'Disabled') return 'disabled';
   if (role === 'PrimaryMovement') return 'move';
   if (role === 'MovementSkill') return 'blink';
   if (role === 'Corpse') return 'corpse';
@@ -1665,6 +1665,19 @@ function changeSkillType(prefix, newType, configIdx) {
   // Apply the role mapping
   if (typeDef.role !== null) {
     updateSetting(`${prefix}.role`, typeDef.role);
+  }
+
+  // Only one primary move key is supported. When a slot becomes Move Only,
+  // clear stale Move Only roles from every other configured slot.
+  if (newType === 'move') {
+    for (let i = 1; i <= 8; i++) {
+      const otherPrefix = `build.skill${i}`;
+      if (otherPrefix === prefix) continue;
+      const otherRole = S[`${otherPrefix}.role`];
+      if (otherRole && otherRole.value === 'PrimaryMovement') {
+        updateSetting(`${otherPrefix}.role`, 'Disabled');
+      }
+    }
   }
 
   // Merge resets with type defaults — defaults override resets, single write per key

@@ -730,6 +730,13 @@ namespace AutoExile.Systems
         /// </summary>
         public static bool StartMovement(Vector2 absScreenPos, Keys moveKey)
         {
+            if (moveKey == Keys.None)
+            {
+                StopMovement();
+                LogAction("StartMovement skipped: move key not configured", absScreenPos, moveKey, false);
+                return false;
+            }
+
             if (TryCaptureReplay("StartMovement", absScreenPos, moveKey)) return true;
             if (!ClampToWindow(ref absScreenPos)) return false;
 
