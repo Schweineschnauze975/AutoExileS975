@@ -236,6 +236,8 @@ namespace AutoExile.Modes
                     _phase = BlightPhase.InHideout;
                     _phaseStartTime = DateTime.Now;
                     _mapCompleted = false;
+                    if (ModeHelpers.FinishAndStopIfArmed(ctx, "Blight", s => StatusText = s))
+                        return;
                     _hideoutFlow.Start(MapDeviceSystem.IsAnyBlightMap);
                     StatusText = "Back in hideout — starting new map";
                 }

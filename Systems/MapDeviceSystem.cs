@@ -70,6 +70,14 @@ namespace AutoExile.Systems
         private bool _nodeSelected;
         private int _nodeClickAttempts;
 
+        // Money guard for auto-match fragment flows (Simulacrum/boss/blight).
+        // Once one fragment is right-clicked into the device, do not search/click
+        // another one if map-loaded detection stalls. Re-armed on successful portal
+        // startup or Cancel, not Start, so restart loops cannot burn extra fragments.
+        private bool _fragmentInserted;
+        private bool _activateClicked;
+        private int _activateMissingAttempts;
+
         // Inventory fragment fallback
         private int _invOpenAttempts;
         private const int MaxInvOpenAttempts = 5;
@@ -128,6 +136,8 @@ namespace AutoExile.Systems
             _nodeClickAttempts = 0;
             _invOpenAttempts = 0;
             _portalFirstSeenAt = null;
+            _activateClicked = false;
+            _activateMissingAttempts = 0;
             Status = "Starting map creation";
             return true;
         }
@@ -142,6 +152,9 @@ namespace AutoExile.Systems
             ScarabPaths = null;
             TargetMapName = null;
             MinMapTier = 0;
+            _fragmentInserted = false;
+            _activateClicked = false;
+            _activateMissingAttempts = 0;
             Status = "Cancelled";
         }
 
@@ -326,8 +339,14 @@ namespace AutoExile.Systems
             var atlas = gc.IngameState.IngameUi.Atlas;
             if (atlas?.IsVisible != true)
             {
+                if (_fragmentInserted)
+                    return ReopenDeviceAfterPanelClosed("[Select] Atlas closed after fragment insert - reopening device");
+
                 Status = "Atlas closed unexpectedly";
                 _phase = MapDevicePhase.Idle;
+                _fragmentInserted = false;
+                _activateClicked = false;
+                _activateMissingAttempts = 0;
                 return MapDeviceResult.Failed;
             }
 
@@ -377,6 +396,14 @@ namespace AutoExile.Systems
                 Status = "[Select] No map name configured — select a map in farming settings";
                 _phase = MapDevicePhase.Idle;
                 return MapDeviceResult.Failed;
+            }
+
+            if (_fragmentInserted && !namedMapFlow)
+            {
+                _phase = NextPhaseAfterMapLoaded();
+                _phaseStartTime = DateTime.Now;
+                Status = "[Select] Fragment already placed - activating (no re-insert)";
+                return MapDeviceResult.InProgress;
             }
 
             if (namedMapFlow)
@@ -498,6 +525,8 @@ namespace AutoExile.Systems
                         if (inserted)
                         {
                             _lastActionTime = DateTime.Now;
+                            if (!namedMapFlow)
+                                _fragmentInserted = true;
                             Status = namedMapFlow
                                 ? $"[Select] Ctrl+clicking inventory map into {TargetMapName} slot"
                                 : "[Select] Right-clicking fragment from inventory";
@@ -538,6 +567,8 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress; // gate blocked, retry next tick
 
             _lastActionTime = DateTime.Now;
+            if (!useCtrlClick)
+                _fragmentInserted = true;
             Status = useCtrlClick
                 ? $"[Select] Ctrl+clicking map into device"
                 : "[Select] Right-clicking fragment into device";
@@ -686,16 +717,42 @@ namespace AutoExile.Systems
             var atlas = gc.IngameState.IngameUi.Atlas;
             if (atlas?.IsVisible != true)
             {
-                // Atlas closed — portals may have spawned
-                _phase = MapDevicePhase.WaitForPortals;
-                _phaseStartTime = DateTime.Now;
-                Status = "Atlas closed — waiting for portals";
-                return MapDeviceResult.InProgress;
+                if (_activateClicked)
+                {
+                    // Atlas closed after a real activate click — portals may have spawned.
+                    _phase = MapDevicePhase.WaitForPortals;
+                    _phaseStartTime = DateTime.Now;
+                    Status = "Atlas closed after activate - waiting for portals";
+                    return MapDeviceResult.InProgress;
+                }
+
+                if (_fragmentInserted)
+                    return ReopenDeviceAfterPanelClosed("[Activate] Panel closed before activate - reopening device");
+
+                Status = "[Activate] Atlas closed before activation";
+                _phase = MapDevicePhase.Idle;
+                return MapDeviceResult.Failed;
             }
 
             var activateBtn = atlas.GetChildFromIndices(ActivateButtonPath);
             if (activateBtn == null || !activateBtn.IsVisible)
             {
+                if (_fragmentInserted)
+                {
+                    _activateMissingAttempts++;
+                    if (!IsMapInDevice(atlas) || _activateMissingAttempts >= 2)
+                    {
+                        _fragmentInserted = false;
+                        _activateClicked = false;
+                        _phase = MapDevicePhase.SelectMap;
+                        _phaseStartTime = DateTime.Now;
+                        Status = "[Activate] Activate missing and no loaded map confirmed - retrying fragment insert";
+                        return MapDeviceResult.InProgress;
+                    }
+
+                    return CloseAtlasAndReopenDevice("[Activate] Activate panel missing - reopening device");
+                }
+
                 Status = "Activate button not found";
                 return MapDeviceResult.InProgress;
             }
@@ -708,6 +765,9 @@ namespace AutoExile.Systems
                 // Bounce back to SelectMap so the map-insertion path runs again.
                 // Common case: bot inserted scarabs but the map insertion never
                 // actually landed (mapStash empty + inventory fallback didn't fire).
+                _fragmentInserted = false;
+                _activateClicked = false;
+                _activateMissingAttempts = 0;
                 Status = "Activate button greyed out — no map loaded; returning to map selection";
                 _phase = MapDevicePhase.SelectMap;
                 _phaseStartTime = DateTime.Now;
@@ -720,6 +780,8 @@ namespace AutoExile.Systems
                 return MapDeviceResult.InProgress;
             }
             _lastActionTime = DateTime.Now;
+            _activateClicked = true;
+            _activateMissingAttempts = 0;
 
             // Stay in Activate phase — next tick will detect atlas closing (lines above)
             // and transition to WaitForPortals only after verification
@@ -731,6 +793,9 @@ namespace AutoExile.Systems
 
         private MapDeviceResult TickWaitForPortals(GameController gc)
         {
+            _fragmentInserted = false;
+            _activateClicked = false;
+
             if ((DateTime.Now - _phaseStartTime).TotalSeconds > BasePortalWaitTimeoutSeconds + ExtraLatencySec)
             {
                 Status = "Timed out waiting for portals";
@@ -874,6 +939,27 @@ namespace AutoExile.Systems
 
         private Entity? FindNearestPortal(GameController gc) =>
             Modes.Shared.ModeHelpers.FindNearestPortal(gc);
+
+        private MapDeviceResult ReopenDeviceAfterPanelClosed(string status)
+        {
+            _phase = MapDevicePhase.NavigateToDevice;
+            _phaseStartTime = DateTime.Now;
+            _activateClicked = false;
+            Status = status;
+            return MapDeviceResult.InProgress;
+        }
+
+        private MapDeviceResult CloseAtlasAndReopenDevice(string status)
+        {
+            if (CanAct() && BotInput.PressKey(Keys.Escape))
+                _lastActionTime = DateTime.Now;
+
+            _phase = MapDevicePhase.NavigateToDevice;
+            _phaseStartTime = DateTime.Now;
+            _activateClicked = false;
+            Status = status;
+            return MapDeviceResult.InProgress;
+        }
 
         private bool IsMapInDevice(Element atlas)
         {

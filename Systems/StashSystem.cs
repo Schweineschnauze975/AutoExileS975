@@ -51,6 +51,9 @@ namespace AutoExile.Systems
         /// <summary>Tab name to switch to before storing items. Null = use current tab.</summary>
         public string? StoreTabName { get; set; }
 
+        /// <summary>Fallback tab to try when storing into the primary tab makes no progress.</summary>
+        public string? StoreFallbackTabName { get; set; }
+
         /// <summary>Tab name to switch to for withdrawing fragments. Null = skip withdraw.</summary>
         public string? WithdrawTabName { get; set; }
 
@@ -77,6 +80,9 @@ namespace AutoExile.Systems
         private StashPhase _afterTabSwitch;
         private int _withdrawsRemaining;
         private int _withdrawListIndex; // which entry of WithdrawList we're processing
+        private bool _storeFallbackAttempted;
+        private bool _storeBatchStarted;
+        private int _storeItemCountBefore;
 
         // Incubator state
         private bool _cursorHasIncubator;
@@ -96,6 +102,7 @@ namespace AutoExile.Systems
         /// </summary>
         public bool Start(
             string? storeTabName = null,
+            string? storeFallbackTabName = null,
             string? withdrawTabName = null,
             string? withdrawFragmentPath = null,
             int withdrawCount = 0,
@@ -107,6 +114,7 @@ namespace AutoExile.Systems
 
             // Reset config — every Start() is a clean slate.
             StoreTabName         = storeTabName;
+            StoreFallbackTabName = storeFallbackTabName;
             WithdrawTabName      = withdrawTabName;
             WithdrawFragmentPath = withdrawFragmentPath;
             WithdrawCount        = withdrawCount;
@@ -134,6 +142,9 @@ namespace AutoExile.Systems
             _incubatorsApplied = 0;
             _pendingTabSwitch = null;
             _afterTabSwitch = StashPhase.Idle;
+            _storeFallbackAttempted = false;
+            _storeBatchStarted = false;
+            _storeItemCountBefore = 0;
 
             _withdrawsRemaining = 0;
             Status = "Starting stash interaction";
@@ -146,6 +157,7 @@ namespace AutoExile.Systems
             _phase = StashPhase.Idle;
             ItemFilter = null;
             StoreTabName = null;
+            StoreFallbackTabName = null;
             WithdrawTabName = null;
             WithdrawFragmentPath = null;
             WithdrawCount = 0;
@@ -177,6 +189,7 @@ namespace AutoExile.Systems
                 // Clear all store/withdraw settings so nothing is deposited
                 ItemFilter = _ => false;
                 StoreTabName = null;
+                StoreFallbackTabName = null;
                 WithdrawTabName = null;
                 WithdrawFragmentPath = null;
                 WithdrawCount = 0;
@@ -328,21 +341,26 @@ namespace AutoExile.Systems
 
         private void EnterStorePhase(GameController gc)
         {
+            EnterStorePhase(gc, StoreTabName);
+        }
+
+        private void EnterStorePhase(GameController gc, string? targetStoreTab)
+        {
             // Switch to store tab if configured and not already on it
-            if (!string.IsNullOrEmpty(StoreTabName))
+            if (!string.IsNullOrEmpty(targetStoreTab))
             {
                 var stash = gc.IngameState?.IngameUi?.StashElement;
                 var names = stash?.AllStashNames;
                 var currentIdx = stash?.IndexVisibleStash ?? -1;
                 if (names != null && currentIdx >= 0 && currentIdx < names.Count
-                    && !names[currentIdx].Equals(StoreTabName, StringComparison.OrdinalIgnoreCase))
+                    && !names[currentIdx].Equals(targetStoreTab, StringComparison.OrdinalIgnoreCase))
                 {
-                    _pendingTabSwitch = StoreTabName;
+                    _pendingTabSwitch = targetStoreTab;
                     _afterTabSwitch = StashPhase.StoreItems;
         
                     _phase = StashPhase.SwitchToStoreTab;
                     _phaseStartTime = DateTime.Now;
-                    Status = $"Switching to {StoreTabName} tab for storing";
+                    Status = $"Switching to {targetStoreTab} tab for storing";
                     return;
                 }
             }
@@ -525,6 +543,7 @@ namespace AutoExile.Systems
 
             var windowRect = gc.Window.GetWindowRectangle();
             var positions = new List<Vector2>();
+            int remainingNeeded = Math.Max(0, wantTotal - haveInInv);
             foreach (var item in items)
             {
                 var entity = item.Entity;
@@ -534,6 +553,8 @@ namespace AutoExile.Systems
                     positions.Add(new Vector2(
                         windowRect.X + rect.Center.X,
                         windowRect.Y + rect.Center.Y));
+                    if (positions.Count >= remainingNeeded)
+                        break;
                 }
             }
 
@@ -544,7 +565,7 @@ namespace AutoExile.Systems
                 return StashResult.InProgress;
             }
 
-            Status = $"Withdrawing '{currentPath}' ({haveInInv}/{wantTotal}, {positions.Count} stash slots)";
+            Status = $"Withdrawing '{currentPath}' ({haveInInv}/{wantTotal}, clicking {positions.Count}/{remainingNeeded} needed)";
             // CtrlClickBatch holds Ctrl down across every click in one async pass,
             // then releases. Items get transferred (stacks fully, single items one-per-click).
             // After the batch completes, IsBatchRunning flips back to false; the
@@ -588,8 +609,37 @@ namespace AutoExile.Systems
             if (BotInput.IsBatchRunning)
                 return StashResult.InProgress;
 
+            if (_storeBatchStarted)
+            {
+                var remaining = CountStashableItems(gc, ItemFilter);
+                var storedThisBatch = Math.Max(0, _storeItemCountBefore - remaining);
+                _itemsStored += storedThisBatch;
+                _storeBatchStarted = false;
+                _storeItemCountBefore = 0;
+
+                if (remaining == 0)
+                {
+                    Status = $"Done - stored {_itemsStored} items - closing stash";
+                    return EnterCloseStash();
+                }
+
+                if (!_storeFallbackAttempted && !string.IsNullOrWhiteSpace(StoreFallbackTabName) &&
+                    !StoreFallbackTabName.Equals(StoreTabName, StringComparison.OrdinalIgnoreCase))
+                {
+                    _storeFallbackAttempted = true;
+                    Status = storedThisBatch > 0
+                        ? $"Primary dump partially full - switching to fallback ({remaining} left)"
+                        : $"Primary dump full - switching to fallback ({remaining} left)";
+                    EnterStorePhase(gc, StoreFallbackTabName);
+                    return StashResult.InProgress;
+                }
+
+                Status = $"Done - stored {_itemsStored} items, {remaining} still in inventory - closing stash";
+                return EnterCloseStash();
+            }
+
             // If we already ran a batch, we're done — close stash
-            if (_itemsStored > 0)
+            if (false && _itemsStored > 0)
             {
                 Status = $"Done — stored {_itemsStored} items — closing stash";
                 return EnterCloseStash();
@@ -623,10 +673,9 @@ namespace AutoExile.Systems
 
             // Fire the batch — single async sequence: hold Ctrl → click all → release Ctrl
             Status = $"Storing {positions.Count} items...";
-            BotInput.CtrlClickBatch(positions, count =>
-            {
-                _itemsStored = count;
-            });
+            _storeItemCountBefore = positions.Count;
+            _storeBatchStarted = true;
+            BotInput.CtrlClickBatch(positions);
             return StashResult.InProgress;
         }
 
@@ -702,6 +751,19 @@ namespace AutoExile.Systems
                 if (filter(item)) return true;
             }
             return false;
+        }
+
+        public static int CountStashableItems(GameController gc, Func<ServerInventory.InventSlotItem, bool>? filter)
+        {
+            var items = GetInventorySlotItems(gc);
+            if (items == null || items.Count == 0) return 0;
+            int count = 0;
+            foreach (var item in items)
+            {
+                if (filter == null || filter(item))
+                    count++;
+            }
+            return count;
         }
 
         private StashResult EnterCloseStash()

@@ -14,6 +14,7 @@ namespace AutoExile.Modes.Shared
     {
         private HideoutPhase _phase = HideoutPhase.Idle;
         private DateTime _phaseStartTime = DateTime.Now;
+        private DateTime _flowStartTime = DateTime.Now;
         private DateTime _lastActionTime = DateTime.MinValue;
 
         // Configuration set via Start()
@@ -24,6 +25,7 @@ namespace AutoExile.Modes.Shared
         private int _minMapTier;
         private int _stashItemThreshold; // only stash when item count >= this (0 = always stash)
         private string? _dumpTabName;
+        private string? _fallbackDumpTabName;
         private string? _resourceTabName;
         private string? _withdrawFragmentPath;
         private int _fragmentStock; // target number of fragments to maintain in inventory
@@ -54,6 +56,7 @@ namespace AutoExile.Modes.Shared
             string? inventoryFragmentPath = null,
             int stashItemThreshold = 0,
             string? dumpTabName = null,
+            string? fallbackDumpTabName = null,
             string? resourceTabName = null,
             string? withdrawFragmentPath = null,
             int fragmentStock = 0,
@@ -68,6 +71,7 @@ namespace AutoExile.Modes.Shared
             _minMapTier = minMapTier;
             _stashItemThreshold = stashItemThreshold;
             _dumpTabName = dumpTabName;
+            _fallbackDumpTabName = fallbackDumpTabName;
             _resourceTabName = resourceTabName;
             _withdrawFragmentPath = withdrawFragmentPath;
             _fragmentStock = fragmentStock;
@@ -76,6 +80,7 @@ namespace AutoExile.Modes.Shared
             _scarabPaths = scarabPaths != null && scarabPaths.Count > 0 ? scarabPaths : null;
             _phase = HideoutPhase.Settle;
             _phaseStartTime = DateTime.Now;
+            _flowStartTime = _phaseStartTime;
             Status = "Hideout — settling";
         }
 
@@ -87,6 +92,7 @@ namespace AutoExile.Modes.Shared
             _mapFilter = null;
             _phase = HideoutPhase.EnterPortal;
             _phaseStartTime = DateTime.Now;
+            _flowStartTime = _phaseStartTime;
             Status = "Re-entering map via portal";
         }
 
@@ -95,6 +101,21 @@ namespace AutoExile.Modes.Shared
         /// </summary>
         public HideoutSignal Tick(BotContext ctx)
         {
+            if (ShouldRestartFullHideoutFlow(ctx))
+            {
+                ctx.Log($"[HideoutFlow] Watchdog restart after {(DateTime.Now - _flowStartTime).TotalSeconds:F0}s in {_phase}: {Status}");
+                ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
+                ctx.Stash.Cancel(ctx.Game);
+                ctx.Interaction.Cancel(ctx.Game);
+                ctx.Navigation.Stop(ctx.Game);
+                BotInput.ReleaseAllKeys();
+                _phase = HideoutPhase.Settle;
+                _phaseStartTime = DateTime.Now;
+                _flowStartTime = _phaseStartTime;
+                Status = "Hideout watchdog restart - preparing next run";
+                return HideoutSignal.InProgress;
+            }
+
             switch (_phase)
             {
                 case HideoutPhase.Settle:
@@ -120,6 +141,7 @@ namespace AutoExile.Modes.Shared
             _minMapTier = 0;
             _stashItemThreshold = 0;
             _dumpTabName = null;
+            _fallbackDumpTabName = null;
             _resourceTabName = null;
             _withdrawFragmentPath = null;
             _fragmentStock = 0;
@@ -130,6 +152,20 @@ namespace AutoExile.Modes.Shared
         }
 
         // ── Phases ──
+
+        private bool ShouldRestartFullHideoutFlow(BotContext ctx)
+        {
+            if (_phase == HideoutPhase.Idle || _mapFilter == null)
+                return false;
+            if (ctx.Game?.Area?.CurrentArea?.IsHideout != true)
+                return false;
+
+            var timeoutMinutes = ctx.Settings.Run.HideoutWaitTimeoutMinutes.Value;
+            if (timeoutMinutes <= 0)
+                return false;
+
+            return (DateTime.Now - _flowStartTime).TotalMinutes >= timeoutMinutes;
+        }
 
         private HideoutSignal TickSettle(BotContext ctx)
         {
@@ -196,6 +232,7 @@ namespace AutoExile.Modes.Shared
                 _phaseStartTime = DateTime.Now;
                 ctx.Stash.Start(
                     storeTabName:         needStore    ? _dumpTabName          : null,
+                    storeFallbackTabName: needStore    ? _fallbackDumpTabName  : null,
                     withdrawTabName:      needWithdraw ? _resourceTabName      : null,
                     // Single-item fields only used when there's no multi-item list.
                     withdrawFragmentPath: needMultiWithdraw ? null : (needSingleWithdraw ? _withdrawFragmentPath : null),
@@ -256,8 +293,7 @@ namespace AutoExile.Modes.Shared
 
         private void StartMapDevice(BotContext ctx)
         {
-            if (ctx.MapDevice.IsBusy)
-                ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
+            ctx.MapDevice.Cancel(ctx.Game, ctx.Navigation);
 
             ctx.MapDevice.TargetMapName = _targetMapName;
             ctx.MapDevice.MinMapTier = _minMapTier;

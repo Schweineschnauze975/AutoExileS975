@@ -13,6 +13,7 @@ using AutoExile.WebServer;
 using System.IO;
 using System.Linq;
 using System.Numerics;
+using System.Text.Json;
 
 namespace AutoExile
 {
@@ -48,6 +49,7 @@ namespace AutoExile
         private ThreatSystem _threat = new();
         private EldritchAltarHandler _altarHandler = new();
         private NinjaPriceService _ninjaPrice = new();
+
         private RuntimeTracker _runtime = new();
         private EntityCache _entityCache = new();
         private ThreatMap _threatMap = new();
@@ -89,6 +91,7 @@ namespace AutoExile
         private string _lastAreaName = "";
         private long _lastAreaHash;
         private DateTime _areaChangedAt = DateTime.MinValue;
+        private bool _prevRunning; // for detecting the stopped->running edge (restart one-shot modes)
         private float AreaSettleSeconds => Settings.AreaSettleSeconds.Value;
 
         // Cross-zone state cache (e.g., Wishes portal round-trip)
@@ -125,10 +128,21 @@ namespace AutoExile
         private bool _buffScanWaitingForCast;
         private const float BuffScanTimeoutSeconds = 8f;
 
+        // Global long-run watchdog. It tracks meaningful progress, not simple patrol movement.
+        private DateTime _lastProgressAt = DateTime.Now;
+        private string _lastProgressReason = "startup";
+        private string _lastProgressSignature = "";
+        private int _watchdogRecoveries;
+        private string _watchdogStatus = "OK";
+        private DateTime _lastWatchdogFireAt = DateTime.MinValue;
+        private DateTime _lastWatchdogStatusWriteAt = DateTime.MinValue;
+
         public override bool Initialise()
         {
             Name = "AutoExile";
             Instance = this;
+            EnsureDumpDirectories();
+            LogMessage($"[AutoExile] Dumps: {GetDumpRoot()}");
             _recorder.SetOutputDir(Path.Combine(DirectoryFullName, "Recordings"));
             _mavenRecorder.Initialize(DirectoryFullName);
             _humanRecorder.Initialize(DirectoryFullName, msg => LogMessage($"[AutoExile] {msg}"));
@@ -164,6 +178,7 @@ namespace AutoExile
             };
 
             RegisterMode(new IdleMode());
+            RegisterMode(new SellMode());
             _followerMode = new FollowerMode();
             RegisterMode(_followerMode);
             _blightMode = new BlightMode();
@@ -293,6 +308,7 @@ namespace AutoExile
                 _webServer.Start();
             }
 
+            WriteWatchdogStatusHeartbeat(force: true);
             return base.Initialise();
         }
 
@@ -366,6 +382,7 @@ namespace AutoExile
 
             var previousAreaName = _lastAreaName;
             LogMessage($"[BotCore] Area changed: '{previousAreaName}' -> '{currentArea}' (hash {_lastAreaHash} -> {currentHash})");
+            MarkWatchdogProgress($"area changed to {currentArea}", resetRecoveries: true);
 
             // Cache current area state before switching (for round-trip zone support)
             // Use area name as cache key so returning to same-named area restores state
@@ -554,7 +571,18 @@ namespace AutoExile
             BotInput.ActionCooldownMs = Settings.ActionCooldownMs.Value;
             BotInput.WindowRect = GameController.Window.GetWindowRectangleTimeCache;
             BotInput.TickHeldKeys(); // Safety watchdog — auto-release stale held keys
-            BotInput.TickMovementLayer(); // Auto-resume movement after discrete actions
+
+            // While the currency-exchange panel is open during a Sell run we are parked at Faustus and
+            // need NO movement. Force the movement layer OFF and don't auto-resume it: otherwise every
+            // keystroke's SuspendMovement snaps the cursor to screen-centre and the layer re-presses the
+            // move key — which yanks the cursor off the search box and leaks the move key into it
+            // (the search box "deselecting itself" mid-type). Nav is likewise skipped below.
+            bool sellPanelOpen = _mode is Modes.SellMode
+                && GameController.IngameState.IngameUi.CurrencyExchangePanel?.IsVisible == true;
+            if (sellPanelOpen)
+                BotInput.StopMovement();          // release the move key, mark movement inactive
+            else
+                BotInput.TickMovementLayer();      // Auto-resume movement after discrete actions
 
             // Sync primary movement key from skill config → NavigationSystem + CombatSystem
             var primaryMove = Settings.Build.GetPrimaryMovement();
@@ -709,16 +737,39 @@ namespace AutoExile
                 ?? "",
                 _navigation, _interaction, _loot, _threat);
 
+            // Rising edge of Running (Insert hotkey or dashboard Start): restart one-shot modes so
+            // they run again on Start instead of sitting idle after their first completed run.
+            if (Settings.Running.Value && !_prevRunning)
+            {
+                MarkWatchdogProgress("bot started", resetRecoveries: true);
+                (_mode as Modes.SellMode)?.Restart();
+            }
+            _prevRunning = Settings.Running.Value;
+
             // Only run full mode logic when running
             if (!Settings.Running)
             {
                 BotInput.StopMovement();
+                MarkWatchdogProgress("bot paused", resetRecoveries: true);
                 return base.Tick();
             }
 
-            // Global interrupts — handle before mode gets control
-            if (!HandleInterrupts())
-                return base.Tick();
+            // These global systems each issue their own key/click input every tick. During a Sell run
+            // (hideout, at Faustus, exchange panel open) they would steal focus from the search box and
+            // leak keystrokes into the game (a minion-link keypress, a flask key, etc.) — and the Sell
+            // flow needs none of them. Skip them entirely while selling.
+            bool selling = _mode is Modes.SellMode;
+
+            if (!selling)
+            {
+                // Deterministic Flame Link on zone-enter / resurrect — links all minions incl. merc.
+                // Runs before the interrupt/area-settle gates so links land before the first wave.
+                TickMinionLink();
+
+                // Global interrupts — handle before mode gets control
+                if (!HandleInterrupts())
+                    return base.Tick();
+            }
 
             // Area change settle — entity list and game state aren't reliable for
             // a few seconds after zone transition. Skip mode logic to prevent
@@ -761,14 +812,279 @@ namespace AutoExile
             // Navigation ticks AFTER mode — mode sets up/updates paths, then nav executes movement.
             // This prevents stale walk commands: the walk command always targets the current path,
             // not a path that's about to be replaced.
-            // Only tick nav when no async action is in flight (cursor settle / key hold).
-            if (canAct)
+            // Only tick nav when no async action is in flight (cursor settle / key hold), and NEVER
+            // while the Sell exchange panel is open — a stray walk command would move the cursor off
+            // the search box and press the move key into it.
+            if (canAct && !sellPanelOpen)
                 _navigation.Tick(GameController);
 
-            // Auto level gems (global, runs across all modes)
-            TickGemLevelUp();
+            // Auto level gems (global) — but not during a Sell run (its clicks would defocus the
+            // exchange search box mid-type).
+            if (!selling)
+                TickGemLevelUp();
+
+            TickGlobalWatchdog();
 
             return base.Tick();
+        }
+
+        private void MarkWatchdogProgress(string reason, bool resetRecoveries = false)
+        {
+            _lastProgressAt = DateTime.Now;
+            _lastProgressReason = reason;
+            _watchdogStatus = $"OK - {reason}";
+            if (resetRecoveries)
+                _watchdogRecoveries = 0;
+        }
+
+        private string GetDumpRoot()
+        {
+            return Path.Combine(DirectoryFullName, "Dumps");
+        }
+
+        private string GetWatchdogDumpDir()
+        {
+            return Path.Combine(GetDumpRoot(), "Watchdog");
+        }
+
+        private void EnsureDumpDirectories()
+        {
+            try
+            {
+                Directory.CreateDirectory(GetDumpRoot());
+                Directory.CreateDirectory(GetWatchdogDumpDir());
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Could not create dump folders: {ex.Message}");
+            }
+        }
+
+        private void TickGlobalWatchdog()
+        {
+            WriteWatchdogStatusHeartbeat();
+
+            if (!Settings.Run.GlobalWatchdogEnabled.Value)
+                return;
+            if (!Settings.Running.Value || _mode is IdleMode or SellMode)
+                return;
+
+            var timeoutMinutes = Settings.Run.GlobalWatchdogTimeoutMinutes.Value;
+            if (timeoutMinutes <= 0)
+                return;
+
+            var signature = BuildWatchdogProgressSignature();
+            if (!string.Equals(signature, _lastProgressSignature, StringComparison.Ordinal))
+            {
+                _lastProgressSignature = signature;
+                MarkWatchdogProgress("state changed");
+                return;
+            }
+
+            if (_combat.InCombat && IsRealSkillAction(_combat.LastSkillAction))
+            {
+                MarkWatchdogProgress("combat skill active");
+                return;
+            }
+
+            var idleSeconds = (DateTime.Now - _lastProgressAt).TotalSeconds;
+            if (idleSeconds < timeoutMinutes * 60)
+            {
+                _watchdogStatus = $"OK - idle {idleSeconds:F0}s";
+                return;
+            }
+
+            if ((DateTime.Now - _lastWatchdogFireAt).TotalSeconds < 15)
+                return;
+            _lastWatchdogFireAt = DateTime.Now;
+
+            _watchdogRecoveries++;
+            var message = $"Global watchdog fired after {idleSeconds:F0}s without progress ({_watchdogRecoveries}/{Settings.Run.MaxWatchdogRecoveries.Value}). Last progress: {_lastProgressReason}.";
+            LogMessage($"[AutoExile] {message}");
+            _dataStore?.RecordEvent("watchdog", message, GameController.Area?.CurrentArea?.Name ?? "");
+            WriteWatchdogReport(message, idleSeconds);
+            TriggerGameStateDump();
+            _recorder.ForceDump("watchdog");
+
+            var maxRecoveries = Settings.Run.MaxWatchdogRecoveries.Value;
+            if (maxRecoveries > 0 && _watchdogRecoveries >= maxRecoveries)
+            {
+                Settings.Running.Value = false;
+                Settings.Run.FinishAndStop.Value = false;
+                if (_lootTracker.IsActive)
+                    _lootTracker.StopSession();
+                Modes.Shared.ModeHelpers.CancelAllSystems(_ctx);
+                _combat.ClearUnreachable();
+                _watchdogStatus = $"NEEDS ATTENTION - watchdog stopped after {_watchdogRecoveries} recoveries";
+                LogMessage($"[AutoExile] {_watchdogStatus}");
+                return;
+            }
+
+            Modes.Shared.ModeHelpers.CancelAllSystems(_ctx);
+            _combat.ClearUnreachable();
+            _entityCache.Rebuild(GameController.EntityListWrapper.OnlyValidEntities);
+            MarkWatchdogProgress("watchdog recovery");
+            _watchdogStatus = $"RECOVERED - watchdog reset {_watchdogRecoveries}";
+        }
+
+        private string BuildWatchdogProgressSignature()
+        {
+            var areaHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0;
+            var targetId = _combat.BestTarget?.Id ?? 0;
+            var parts = new List<string>
+            {
+                _mode?.Name ?? "",
+                areaHash.ToString(),
+                _lootTracker.TotalItemsLooted.ToString(),
+                _lootTracker.MapsCompleted.ToString(),
+                targetId.ToString(),
+            };
+
+            if (_mode is SimulacrumMode sim)
+            {
+                parts.Add(sim.Phase.ToString());
+                parts.Add(sim.State.CurrentWave.ToString());
+                parts.Add(sim.State.IsWaveActive.ToString());
+                parts.Add(sim.State.RunsCompleted.ToString());
+                parts.Add(sim.State.DeathCount.ToString());
+                parts.Add(sim.State.HighestWaveThisRun.ToString());
+            }
+            else if (_mode is BossMode boss)
+            {
+                parts.Add(boss.Phase.ToString());
+                parts.Add(boss.RunsCompleted.ToString());
+                parts.Add(boss.Deaths.ToString());
+                parts.Add(boss.TargetItemsLooted.ToString());
+            }
+            else if (_mode is BlightMode blight)
+            {
+                parts.Add(blight.Phase.ToString());
+                parts.Add(blight.State.AliveMonsterCount.ToString());
+                parts.Add(blight.State.DeathCount.ToString());
+                parts.Add(blight.State.EncounterSucceeded.ToString());
+            }
+            else if (_mode is LabyrinthMode lab)
+            {
+                parts.Add(lab.Phase.ToString());
+                parts.Add(lab.State.RunsCompleted.ToString());
+                parts.Add(lab.State.DeathCount.ToString());
+                parts.Add(lab.State.IzaroEncounterCount.ToString());
+            }
+            else if (_mode is Modes.WaveFarm.WaveFarmMode farm)
+            {
+                parts.Add(farm.Status);
+                parts.Add(farm.RunsCompleted.ToString());
+            }
+
+            return string.Join("|", parts);
+        }
+
+        private static bool IsRealSkillAction(string? action)
+        {
+            if (string.IsNullOrWhiteSpace(action))
+                return false;
+            if (!action.Contains('('))
+                return false;
+            return !action.StartsWith("no ", StringComparison.OrdinalIgnoreCase)
+                && !action.Contains("skip", StringComparison.OrdinalIgnoreCase)
+                && !action.Contains("not ready", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void WriteWatchdogStatusHeartbeat(bool force = false)
+        {
+            try
+            {
+                if (!force && (DateTime.Now - _lastWatchdogStatusWriteAt).TotalSeconds < 60)
+                    return;
+
+                EnsureDumpDirectories();
+                _lastWatchdogStatusWriteAt = DateTime.Now;
+                var file = Path.Combine(GetWatchdogDumpDir(), "WatchdogStatus.json");
+                var idleSeconds = (DateTime.Now - _lastProgressAt).TotalSeconds;
+                var player = GameController.Player;
+                var status = new
+                {
+                    time = DateTime.Now.ToString("O"),
+                    running = Settings.Running.Value,
+                    watchdogEnabled = Settings.Run.GlobalWatchdogEnabled.Value,
+                    watchdogStatus = _watchdogStatus,
+                    idleSeconds,
+                    lastProgressAt = _lastProgressAt.ToString("O"),
+                    lastProgressReason = _lastProgressReason,
+                    recoveries = _watchdogRecoveries,
+                    timeoutMinutes = Settings.Run.GlobalWatchdogTimeoutMinutes.Value,
+                    maxRecoveries = Settings.Run.MaxWatchdogRecoveries.Value,
+                    mode = _mode?.Name ?? "",
+                    area = GameController.Area?.CurrentArea?.Name ?? "",
+                    areaHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0,
+                    playerGrid = player != null ? new[] { player.GridPosNum.X, player.GridPosNum.Y } : Array.Empty<float>(),
+                    dumpRoot = GetDumpRoot(),
+                    watchdogDir = GetWatchdogDumpDir()
+                };
+
+                File.WriteAllText(file, JsonSerializer.Serialize(status, new JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Watchdog status write failed: {ex.Message}");
+            }
+        }
+
+        private void WriteWatchdogReport(string message, double idleSeconds)
+        {
+            try
+            {
+                EnsureDumpDirectories();
+                var dir = GetWatchdogDumpDir();
+                var file = Path.Combine(dir, $"Watchdog_{DateTime.Now:yyyyMMdd_HHmmss}.json");
+                var player = GameController.Player;
+                var report = new
+                {
+                    time = DateTime.Now.ToString("O"),
+                    message,
+                    idleSeconds,
+                    recoveries = _watchdogRecoveries,
+                    maxRecoveries = Settings.Run.MaxWatchdogRecoveries.Value,
+                    lastProgressAt = _lastProgressAt.ToString("O"),
+                    lastProgressReason = _lastProgressReason,
+                    mode = _mode?.Name ?? "",
+                    area = GameController.Area?.CurrentArea?.Name ?? "",
+                    areaHash = GameController.IngameState?.Data?.CurrentAreaHash ?? 0,
+                    playerGrid = player != null ? new[] { player.GridPosNum.X, player.GridPosNum.Y } : Array.Empty<float>(),
+                    mapDevice = new { _mapDevice.Phase, _mapDevice.Status, _mapDevice.IsBusy },
+                    stash = new { _stash.Status, _stash.IsBusy },
+                    interaction = new { _interaction.Status, _interaction.IsBusy },
+                    navigation = new { _navigation.IsNavigating, _navigation.CurrentWaypointIndex, waypointTotal = _navigation.CurrentNavPath?.Count ?? 0 },
+                    combat = new
+                    {
+                        _combat.InCombat,
+                        _combat.NearbyMonsterCount,
+                        _combat.CachedMonsterCount,
+                        target = _combat.BestTarget?.RenderName,
+                        targetId = _combat.BestTarget?.Id,
+                        _combat.LastAction,
+                        _combat.LastSkillAction
+                    },
+                    simulacrum = _simulacrumMode == null ? null : new
+                    {
+                        phase = _simulacrumMode.Phase.ToString(),
+                        wave = _simulacrumMode.State.CurrentWave,
+                        active = _simulacrumMode.State.IsWaveActive,
+                        deaths = _simulacrumMode.State.DeathCount,
+                        runs = _simulacrumMode.State.RunsCompleted,
+                        status = _simulacrumMode.StatusText,
+                        decision = _simulacrumMode.Decision
+                    }
+                };
+
+                File.WriteAllText(file, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }));
+                WriteWatchdogStatusHeartbeat(force: true);
+                LogMessage($"[AutoExile] Watchdog report written: {file}");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[AutoExile] Watchdog report failed: {ex.Message}");
+            }
         }
 
         public override void Render()
@@ -788,6 +1104,22 @@ namespace AutoExile
                 }
                 else if (_lootTracker.IsActive)
                     _lootTracker.StopSession();
+            }
+
+            if (Settings.FinishAndStopHotkey.PressedOnce())
+            {
+                Settings.Run.FinishAndStop.Value = !Settings.Run.FinishAndStop.Value;
+                if (Settings.Run.FinishAndStop.Value)
+                {
+                    Settings.Running.Value = true;
+                    if (!_lootTracker.IsActive)
+                        _lootTracker.StartSession();
+                    LogMessage("[AutoExile] Finish and stop armed by hotkey");
+                }
+                else
+                {
+                    LogMessage("[AutoExile] Finish and stop disarmed by hotkey");
+                }
             }
 
             UpdateDebugRangeCircle();
@@ -823,6 +1155,16 @@ namespace AutoExile
             }
             Graphics.DrawText(runtimeText, new Vector2(100, 96), runtimeColor);
 
+            if (Settings.Run.FinishAndStop.Value)
+            {
+                var winWidth = GameController.Window.GetWindowRectangle().Width;
+                Graphics.DrawText("Finish & Stop: ARMED", new Vector2(winWidth / 2f - 90f, 18), SharpDX.Color.Orange);
+            }
+
+            // Minimal sell-mode status line.
+            if (_mode is SellMode sellMode)
+                Graphics.DrawText($"SELL: {sellMode.Status}", new Vector2(100, 140), SharpDX.Color.Gold);
+
             // Human recorder indicator
             if (_humanRecorder.IsRecording)
             {
@@ -831,8 +1173,8 @@ namespace AutoExile
             }
 
             // Loot tracker overlay (top-right area)
-            var winWidth = GameController.Window.GetWindowRectangle().Width;
-            _lootTracker.Render(Graphics, new Vector2(winWidth - 250, 80));
+            var lootWinWidth = GameController.Window.GetWindowRectangle().Width;
+            _lootTracker.Render(Graphics, new Vector2(lootWinWidth - 250, 80));
 
             // Pass graphics to context for mode rendering
             _ctx.Graphics = Graphics;
@@ -990,10 +1332,18 @@ namespace AutoExile
                 switch (cmd.Action)
                 {
                     case "start":
+                        Settings.Run.FinishAndStop.Value = false;
                         Settings.Running.Value = true;
                         if (!_lootTracker.IsActive) _lootTracker.StartSession();
                         break;
+                    case "finishStop":
+                        Settings.Run.FinishAndStop.Value = true;
+                        Settings.Running.Value = true;
+                        if (!_lootTracker.IsActive) _lootTracker.StartSession();
+                        LogMessage("[AutoExile] Finish and stop armed - bot will stop after the current completed run");
+                        break;
                     case "stop":
+                        Settings.Run.FinishAndStop.Value = false;
                         Settings.Running.Value = false;
                         if (_lootTracker.IsActive) _lootTracker.StopSession();
                         break;
@@ -1051,8 +1401,7 @@ namespace AutoExile
                         for (int i = 0; i < limit; i++)
                         {
                             var key = _combat.KeyForSlot(i);
-                            // Skip mouse-only slots — we don't support click-based skill usage
-                            if (key == Keys.None || key == Keys.RButton || key == Keys.MButton)
+                            if (key == Keys.None)
                                 continue;
 
                             var skillId = barIds[i];
@@ -1105,6 +1454,7 @@ namespace AutoExile
                     Decision = decision,
                     Status = status,
                     Area = GameController.Area?.CurrentArea?.Name ?? "",
+                    FinishAndStop = Settings.Run.FinishAndStop.Value,
                     HpPercent = hpPct,
                     EsPercent = esPct,
                     ManaPercent = manaPct,
@@ -1131,6 +1481,9 @@ namespace AutoExile
                         ? (int)_runtime.Remaining(Settings.Run.MaxRuntimeMinutes.Value).TotalSeconds
                         : 0,
                     RuntimeMaxMinutes       = Settings.Run.MaxRuntimeMinutes.Value,
+                    WatchdogStatus = _watchdogStatus,
+                    WatchdogRecoveries = _watchdogRecoveries,
+                    WatchdogLastProgressSeconds = (int)Math.Max(0, (DateTime.Now - _lastProgressAt).TotalSeconds),
                     // Simulacrum stats
                     SimWave = _simulacrumMode?.State.CurrentWave ?? 0,
                     SimWaveActive = _simulacrumMode?.State.IsWaveActive ?? false,
@@ -1298,7 +1651,8 @@ namespace AutoExile
 
             var playerGrid = new Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
             var areaName = gc.Area?.CurrentArea?.Name ?? "Unknown";
-            var outputDir = Path.Combine(DirectoryFullName, "Dumps");
+            EnsureDumpDirectories();
+            var outputDir = GetDumpRoot();
 
             // Capture live game state on the main thread (entity refs aren't safe on thread pool)
             var snapshot = BuildGameStateSnapshot(gc, playerGrid);
@@ -1662,6 +2016,88 @@ namespace AutoExile
         private DateTime _lastReviveClickAt = DateTime.MinValue;
         private DateTime _lastDismissAt = DateTime.MinValue;
         private readonly Random _rng = new();
+
+        // ── Deterministic Flame Link burst state ──
+        private long _linkSeenAreaHash = -1;
+        private bool _linkSeenDead;
+        private DateTime _linkArmedAt = DateTime.MinValue;
+        private bool _linkBurstActive;
+        private readonly HashSet<uint> _linkCastThisBurst = new();
+
+        /// <summary>
+        /// On entering a new area or resurrecting, link every nearby friendly minion (spectres,
+        /// Animated Guardian, mercenary — all non-hostile Monster entities) with Flame Link, once
+        /// each. Reuses the key from the "Link (minion)" skill slot. The mercenary only exists in
+        /// maps and can load a moment late, so the burst keeps linking new arrivals until it times
+        /// out. Only fires while the bot is Running.
+        /// </summary>
+        private void TickMinionLink()
+        {
+            var gc = GameController;
+            if (gc == null || !gc.InGame || gc.IsLoading) return;
+            var player = gc.Player;
+            if (player == null) return;
+
+            // Flame Link key comes from the configured Minion-role skill slot.
+            var linkKey = System.Windows.Forms.Keys.None;
+            foreach (var slot in Settings.Build.AllSkillSlots)
+            {
+                if (slot.Role.Value == "Minion" && slot.Key.Value != System.Windows.Forms.Keys.None)
+                { linkKey = slot.Key.Value; break; }
+            }
+            if (linkKey == System.Windows.Forms.Keys.None) return;
+
+            // ── Triggers: new area hash, or just resurrected ──
+            long hash = gc.IngameState?.Data?.CurrentAreaHash ?? 0;
+            bool alive = player.IsAlive;
+            if (hash != 0 && hash != _linkSeenAreaHash)
+            {
+                _linkSeenAreaHash = hash;
+                ArmLinkBurst();
+            }
+            if (alive && _linkSeenDead)
+                ArmLinkBurst();
+            _linkSeenDead = !alive;
+
+            if (!_linkBurstActive || !alive) return;
+
+            var sinceArm = (DateTime.Now - _linkArmedAt).TotalMilliseconds;
+            if (sinceArm < 1000) return;                                   // settle: let minions load in
+            if (sinceArm > 8000) { _linkBurstActive = false; return; }     // window closed
+            if (!BotInput.CanAct) return;
+
+            // Nearest non-hostile living minion not yet linked this burst.
+            var pPos = player.GridPosNum;
+            Entity? target = null;
+            float best = float.MaxValue;
+            foreach (var e in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (e == null || e.Id == player.Id || e.IsHostile) continue;
+                if (e.Type != ExileCore.Shared.Enums.EntityType.Monster) continue;
+                if (_linkCastThisBurst.Contains(e.Id)) continue;
+                var life = e.GetComponent<ExileCore.PoEMemory.Components.Life>();
+                if (life == null || life.CurHP <= 0) continue;
+                var d = Vector2.Distance(e.GridPosNum, pPos);
+                if (d > 100f) continue;
+                if (d < best) { best = d; target = e; }
+            }
+            if (target == null) return; // none pending now — keep window open for late arrivals (merc)
+
+            var screen = Pathfinding.GridToScreen(gc, target.GridPosNum);
+            var rect = gc.Window.GetWindowRectangle();
+            if (screen.X < 0 || screen.X > rect.Width || screen.Y < 0 || screen.Y > rect.Height)
+            { _linkCastThisBurst.Add(target.Id); return; } // off-screen — skip this burst
+            var abs = new Vector2(rect.X + screen.X, rect.Y + screen.Y);
+            if (BotInput.CursorPressKey(abs, linkKey))
+                _linkCastThisBurst.Add(target.Id);
+        }
+
+        private void ArmLinkBurst()
+        {
+            _linkBurstActive = true;
+            _linkArmedAt = DateTime.Now;
+            _linkCastThisBurst.Clear();
+        }
 
         private bool HandleInterrupts()
         {
@@ -2074,17 +2510,21 @@ namespace AutoExile
                 // this, opening a stash that doesn't have your supplies tab visible
                 // (premium tabs, scrolled offscreen) would silently wipe the setting.
                 var savedDump     = Settings.Stash.DumpTabName.Value;
+                var savedFallback = Settings.Stash.FallbackDumpTabName.Value;
                 var savedFragment = Settings.Stash.FragmentTabName.Value;
                 var savedSupplies = Settings.Stash.MappingSuppliesTabName.Value;
 
                 var dumpOptions     = WithSavedOption(options, savedDump);
+                var fallbackOptions = WithSavedOption(options, savedFallback);
                 var fragmentOptions = WithSavedOption(options, savedFragment);
                 var suppliesOptions = WithSavedOption(options, savedSupplies);
 
                 Settings.Stash.DumpTabName.SetListValues(dumpOptions);
+                Settings.Stash.FallbackDumpTabName.SetListValues(fallbackOptions);
                 Settings.Stash.FragmentTabName.SetListValues(fragmentOptions);
                 Settings.Stash.MappingSuppliesTabName.SetListValues(suppliesOptions);
                 Settings.Stash.DumpTabName.Value            = savedDump;
+                Settings.Stash.FallbackDumpTabName.Value    = savedFallback;
                 Settings.Stash.FragmentTabName.Value        = savedFragment;
                 Settings.Stash.MappingSuppliesTabName.Value = savedSupplies;
             }
@@ -2194,8 +2634,8 @@ namespace AutoExile
         {
             if (_tileSignatures.Count == 0) return;
 
-            var outputDir = Path.Combine(DirectoryFullName, "Dumps");
-            Directory.CreateDirectory(outputDir);
+            EnsureDumpDirectories();
+            var outputDir = GetDumpRoot();
             var logPath = Path.Combine(outputDir, "TileSignatures.log");
 
             var lines = new List<string>();
@@ -2228,10 +2668,11 @@ namespace AutoExile
             var numCols = (int)terrain.NumCols;
             var numRows = (int)terrain.NumRows;
 
-            TileStructure[] tileData;
-            try { tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray); }
-            catch { LogMessage("[AutoExile] TileDump: failed to read tile data"); return; }
-            if (tileData == null || tileData.Length == 0) return;
+            if (!TileMap.TryReadTileData(gc, out var tileData) || tileData.Length == 0)
+            {
+                LogMessage("[AutoExile] TileDump: failed to read tile data");
+                return;
+            }
 
             var playerGrid = new System.Numerics.Vector2(gc.Player.GridPosNum.X, gc.Player.GridPosNum.Y);
 
@@ -2279,7 +2720,7 @@ namespace AutoExile
                 }
             }
 
-            var outputDir = Path.Combine(DirectoryFullName, "Dumps");
+            var outputDir = GetDumpRoot();
             var scanTime = DateTime.Now;
 
             // Write JSON on background thread

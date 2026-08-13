@@ -18,6 +18,7 @@ namespace AutoExile.Systems
 
         public bool IsLoaded => _priceCount > 0;
         public int PriceCount => _priceCount;
+        public string CacheDir => _cacheDir;   // for writing diagnostics (e.g. unpriced owned items)
         public string Status { get; private set; } = "not initialized";
         public DateTime LastRefreshTime { get; private set; } = DateTime.MinValue;
         public int RefreshIntervalMinutes { get; set; } = 20;
@@ -40,6 +41,47 @@ namespace AutoExile.Systems
 
         // Currency prices need special handling (different API shape)
         private volatile Dictionary<string, double> _currencyPrices = new();
+        // Same prices keyed by a normalized name (lowercase, straight apostrophes, collapsed spaces)
+        // so lookups survive the game's typographic apostrophe (U+2019) vs ninja's straight one, plus
+        // minor case/whitespace differences.
+        private volatile Dictionary<string, double> _currencyPricesNorm = new();
+
+        // Normalize an item name for tolerant matching: lowercase, typographic apostrophes → straight,
+        // collapse internal whitespace. (Ninja names are ASCII with straight quotes; the game emits
+        // U+2019 for apostrophes, which is why exact matches miss for possessive names.)
+        private static string NormalizeName(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s ?? "";
+            var sb = new System.Text.StringBuilder(s.Length);
+            bool lastSpace = false;
+            foreach (var ch in s)
+            {
+                char c = ch;
+                if (c == '’' || c == '‘' || c == 'ʼ' || c == '`') c = '\'';
+                if (char.IsWhiteSpace(c))
+                {
+                    if (!lastSpace && sb.Length > 0) { sb.Append(' '); lastSpace = true; }
+                    continue;
+                }
+                sb.Append(char.ToLowerInvariant(c));
+                lastSpace = false;
+            }
+            int end = sb.Length;
+            while (end > 0 && sb[end - 1] == ' ') end--;
+            return sb.ToString(0, end);
+        }
+
+        // Exact currency-price lookup, falling back to the normalized index.
+        private bool TryGetCurrencyPrice(string name, out double val)
+        {
+            if (!string.IsNullOrEmpty(name))
+            {
+                if (_currencyPrices.TryGetValue(name, out val)) return true;
+                if (_currencyPricesNorm.TryGetValue(NormalizeName(name), out val)) return true;
+            }
+            val = 0;
+            return false;
+        }
 
         // Unique art path → list of possible unique names
         private volatile Dictionary<string, List<string>> _uniqueArtMapping = new();
@@ -188,7 +230,7 @@ namespace AutoExile.Systems
 
             if (CurrencyEndpoints.ContainsKey(category))
             {
-                if (_currencyPrices.TryGetValue(name, out var chaosVal))
+                if (TryGetCurrencyPrice(name, out var chaosVal))
                     return new PriceResult { MinChaosValue = chaosVal, MaxChaosValue = chaosVal, MatchCount = 1 };
                 return PriceResult.Zero;
             }
@@ -298,7 +340,7 @@ namespace AutoExile.Systems
             // ── Currency/stackable: lookup by base name, multiply by stack ──
             if (CurrencyEndpoints.ContainsKey(category.Value))
             {
-                if (_currencyPrices.TryGetValue(baseName, out var chaosVal))
+                if (TryGetCurrencyPrice(baseName, out var chaosVal))
                 {
                     var total = chaosVal * stackSize;
                     return new PriceResult { MinChaosValue = total, MaxChaosValue = total, MatchCount = 1 };
@@ -838,7 +880,7 @@ namespace AutoExile.Systems
                     {
                         try
                         {
-                            var url = $"https://poe.ninja/api/data/itemoverview?league={Uri.EscapeDataString(league)}&type={type}&language=en";
+                            var url = $"https://poe.ninja/poe1/api/economy/stash/current/item/overview?league={Uri.EscapeDataString(league)}&type={type}";
                             var cacheFile = Path.Combine(cacheDir, $"{type}.json");
                             var json = await FetchWithCache(url, cacheFile);
                             if (json == null) continue;
@@ -849,7 +891,7 @@ namespace AutoExile.Systems
 
                             // Filter out relics
                             var lines = response.Lines
-                                .Where(l => !l.DetailsId.Contains("-relic"))
+                                .Where(l => string.IsNullOrEmpty(l.DetailsId) || !l.DetailsId.Contains("-relic"))
                                 .ToList();
 
                             // Index by name
@@ -886,9 +928,15 @@ namespace AutoExile.Systems
                     }
                     catch { }
 
+                    // Normalized index for tolerant lookup (apostrophe/case/whitespace).
+                    var newCurrencyPricesNorm = new Dictionary<string, double>(StringComparer.Ordinal);
+                    foreach (var (n, v) in newCurrencyPrices)
+                        newCurrencyPricesNorm[NormalizeName(n)] = v;
+
                     // Atomic swap
                     _prices = newPrices;
                     _currencyPrices = newCurrencyPrices;
+                    _currencyPricesNorm = newCurrencyPricesNorm;
                     _priceCount = totalEntries;
                     LastRefreshTime = DateTime.Now;
                     Status = $"loaded {totalEntries} prices ({successCount}/{totalEndpoints} endpoints)";

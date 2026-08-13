@@ -29,7 +29,7 @@
       <HintPath>Resources\ExileCore.dll</HintPath>
     </Reference>
     <Reference Include="GameOffsets">
-      <HintPath>Resources\GameOffsets.dll</HintPath>
+      <HintPath>..\..\..\GameOffsets.dll</HintPath>
     </Reference>
     <Reference Include="ImGui.NET">
       <HintPath>Resources\ImGui.NET.dll</HintPath>

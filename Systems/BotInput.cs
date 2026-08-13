@@ -509,6 +509,10 @@ namespace AutoExile.Systems
 
         private static void SendKeyDown(Keys key, string context = "")
         {
+            if (key == Keys.LButton) { SendLeftDown(context); return; }
+            if (key == Keys.RButton) { SendRightDown(context); return; }
+            if (key == Keys.MButton) { SendMiddleDown(context); return; }
+
             if (!CanSendInputEvent)
             {
                 LogRawInput("KeyDown-DROPPED", $"{key} {context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
@@ -520,6 +524,10 @@ namespace AutoExile.Systems
 
         private static void SendKeyUp(Keys key, string context = "")
         {
+            if (key == Keys.LButton) { SendLeftUp(context); return; }
+            if (key == Keys.RButton) { SendRightUp(context); return; }
+            if (key == Keys.MButton) { SendMiddleUp(context); return; }
+
             MarkInputEvent("KeyUp", $"{key} {context}".Trim());
             Input.KeyUp(key);
         }
@@ -556,6 +564,23 @@ namespace AutoExile.Systems
         {
             MarkInputEvent("RightUp", context);
             Input.RightUp();
+        }
+
+        private static void SendMiddleDown(string context = "")
+        {
+            if (!CanSendInputEvent)
+            {
+                LogRawInput("MiddleDown-DROPPED", $"{context} (too soon: {(DateTime.Now - _lastInputEvent).TotalMilliseconds:F0}ms)".Trim());
+                return;
+            }
+            MarkInputEvent("MiddleDown", context);
+            mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, UIntPtr.Zero);
+        }
+
+        private static void SendMiddleUp(string context = "")
+        {
+            MarkInputEvent("MiddleUp", context);
+            mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, UIntPtr.Zero);
         }
 
         /// <summary>
@@ -596,6 +621,12 @@ namespace AutoExile.Systems
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
+        private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+        private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
 
         /// <summary>True if the OS reports a modifier key as physically held
         /// (outside our own tracking — e.g. a user-pressed key or a leaked
@@ -1222,6 +1253,83 @@ namespace AutoExile.Systems
             _ = DoPressKey(key, hold);
             LogAction("PressKey", null, key, true);
             return true;
+        }
+
+        /// <summary>Typing hold (key down→up) for text-field entry.</summary>
+        public const int TypingHoldMs = 12;
+        /// <summary>Gate reserved per typed key. Much smaller than ActionCooldownMs — typing into a
+        /// focused UI field is not a game action, so it needn't be paced like skills/movement. The
+        /// caller still spaces keys with its own type interval (kept human-plausible, ~10 keys/s).</summary>
+        public const int TypingReserveMs = 55;
+
+        /// <summary>
+        /// Fast key press for TYPING into a focused text field (search box, amount box). Sends at
+        /// text-field speed instead of the game-action cadence: it bypasses the inter-event gap that
+        /// paces skills/movement and reserves only a small typing gate. Does NOT suspend movement or
+        /// release held keys (callers use it only inside UI panels where neither applies). Only use
+        /// this when a field is known-focused — a leaked key still reaches the game.
+        /// </summary>
+        public static bool PressKeyTyping(Keys key)
+        {
+            if (TryCaptureReplay("PressKeyTyping", key: key)) return true;
+            NextActionAt = DateTime.Now.AddMilliseconds(TypingReserveMs);
+            _ = DoPressKeyTyping(key);
+            LogAction("PressKeyTyping", null, key, true);
+            return true;
+        }
+
+        private static async Task DoPressKeyTyping(Keys key)
+        {
+            // Send directly (no CanSendInputEvent drop / SendDelay gap) — typing cadence, not action
+            // cadence. Still marks the event so rate monitoring + CanTick see the activity.
+            MarkInputEvent("KeyDown", $"{key} type");
+            Input.KeyDown(key);
+            await Task.Delay(TypingHoldMs);
+            MarkInputEvent("KeyUp", $"{key} type");
+            Input.KeyUp(key);
+        }
+
+        /// <summary>
+        /// Type literal text into a focused game text field (e.g. a search box). Sends letters,
+        /// digits and spaces; other characters are skipped. Brief blocking delays let the game
+        /// register each keystroke.
+        /// </summary>
+        public static void TypeText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            foreach (char ch in text)
+            {
+                char c = char.ToLowerInvariant(ch);
+                Keys k;
+                if (c >= 'a' && c <= 'z') k = (Keys)((int)Keys.A + (c - 'a'));
+                else if (c >= '0' && c <= '9') k = (Keys)((int)Keys.D0 + (c - '0'));
+                else if (c == ' ') k = Keys.Space;
+                else continue;
+                SendKeyDown(k, "type");
+                System.Threading.Thread.Sleep(25);
+                SendKeyUp(k, "type");
+                System.Threading.Thread.Sleep(25);
+            }
+        }
+
+        /// <summary>Select-all (Ctrl+A) in a focused text field so the next typed value replaces it.</summary>
+        public static void SelectAll()
+        {
+            // Ctrl+A must land as a real combo. SendKeyDown DROPS any down-event that arrives within
+            // the input-rate gap (MinInputEventGapMs = ActionCooldownMs, default 100ms) of the previous
+            // event — so a 30ms sleep silently drops the A, degrading Ctrl+A to a lone Ctrl press and
+            // leaving stale text in the field (corrupts the next search filter / amount entry). Wait
+            // the full gap ahead of BOTH down-events so neither is dropped.
+            int gap = Math.Max(35, MinInputEventGapMs + 10);
+            var sinceLast = (int)(DateTime.Now - _lastInputEvent).TotalMilliseconds;
+            if (sinceLast < gap) System.Threading.Thread.Sleep(gap - sinceLast);
+            SendKeyDown(Keys.LControlKey, "selall");
+            System.Threading.Thread.Sleep(gap);
+            SendKeyDown(Keys.A, "selall");
+            System.Threading.Thread.Sleep(Math.Max(30, RandHold()));
+            SendKeyUp(Keys.A, "selall");
+            SendKeyUp(Keys.LControlKey, "selall");
+            System.Threading.Thread.Sleep(30);
         }
 
         /// <summary>

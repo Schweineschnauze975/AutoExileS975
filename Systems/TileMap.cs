@@ -15,6 +15,7 @@ namespace AutoExile.Systems
     /// </summary>
     public class TileMap
     {
+        private const bool EnableTerrainTileScan = false;
         private ConcurrentDictionary<string, List<Vector2>> _tiles = new();
         private bool _loaded;
         private string _loadedArea = "";
@@ -35,12 +36,10 @@ namespace AutoExile.Systems
                 if (terrain.NumCols == 0 || terrain.NumRows == 0)
                     return false;
 
-                var tiles = new ConcurrentDictionary<string, List<Vector2>>();
-                TileStructure[] tileData = memory.ReadStdVector<TileStructure>(terrain.TgtArray);
-
-                if (tileData == null || tileData.Length == 0)
+                if (!TryReadTileData(gc, out var tileData) || tileData.Length == 0)
                     return false;
 
+                var tiles = new ConcurrentDictionary<string, List<Vector2>>();
                 var numCols = (int)terrain.NumCols;
 
                 Parallel.ForEach(
@@ -83,6 +82,12 @@ namespace AutoExile.Systems
             {
                 return false;
             }
+        }
+
+        public static bool TryReadTileData(GameController gc, out TileStructure[] tileData)
+        {
+            tileData = Array.Empty<TileStructure>();
+            return EnableTerrainTileScan;
         }
 
         /// <summary>

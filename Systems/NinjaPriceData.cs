@@ -47,6 +47,8 @@ namespace AutoExile.Systems
 
     public class ItemLine
     {
+        private double? _chaosValue;
+
         [JsonPropertyName("id")]
         public long Id { get; set; }
 
@@ -57,7 +59,14 @@ namespace AutoExile.Systems
         public string BaseType { get; set; } = "";
 
         [JsonPropertyName("chaosValue")]
-        public double? ChaosValue { get; set; }
+        public double? ChaosValue
+        {
+            get => _chaosValue ?? PrimaryValue;
+            set => _chaosValue = value;
+        }
+
+        [JsonPropertyName("primaryValue")]
+        public double? PrimaryValue { get; set; }
 
         [JsonPropertyName("divineValue")]
         public double? DivineValue { get; set; }

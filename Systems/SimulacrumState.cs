@@ -96,6 +96,18 @@ namespace AutoExile.Systems
             _lastMonolithUpdate = DateTime.MinValue;
         }
 
+        /// <summary>
+        /// Clear a cached stash position that repeatedly failed to resolve to a real
+        /// interactable stash (false-positive prop, or an unreachable real stash). Prevents
+        /// the mode from re-targeting it. Note: Tick re-caches if a real EntityType.Stash
+        /// exists, so callers also gate stash usage with their own "unavailable" flag.
+        /// </summary>
+        public void ClearStashPosition()
+        {
+            StashPosition = null;
+            StashId = null;
+        }
+
         public void RecordRunComplete()
         {
             _runHistory.Add(new RunRecord
@@ -209,8 +221,16 @@ namespace AutoExile.Systems
                 }
                 if (stash == null)
                 {
-                    stash = gc.EntityListWrapper.OnlyValidEntities
-                        .FirstOrDefault(e => e.Metadata?.Contains("Metadata/MiscellaneousObjects/Stash") == true);
+                    // Match the SAME signal StashSystem.FindStashEntity uses to RESOLVE the
+                    // stash — EntityType.Stash — not a loose metadata substring. Some arena
+                    // layouts (e.g. Lunacy's Watch) contain a decorative object whose metadata
+                    // includes "Stash" but which is NOT an interactable stash; the old substring
+                    // match cached that prop's position and the bot walked there forever
+                    // ("Stash not found"). If the arena has no real stash, StashPosition stays
+                    // null and between-wave stashing is simply skipped (items go to the hideout
+                    // stash on the next run's opening trip).
+                    stash = gc.EntityListWrapper.ValidEntitiesByType[EntityType.Stash]
+                        .FirstOrDefault();
                     if (stash != null)
                         StashId = stash.Id;
                 }

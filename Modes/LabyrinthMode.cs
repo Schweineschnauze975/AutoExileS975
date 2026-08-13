@@ -446,6 +446,11 @@ namespace AutoExile.Modes
                         _state.RecordRunComplete();
                         ctx.LootTracker.RecordMapComplete();
                         ctx.Log($"Lab run {_state.RunsCompleted} complete. Profit: {_state.TotalProfit:F0}c");
+                        if (ModeHelpers.FinishAndStopIfArmed(ctx, "Labyrinth", s => StatusText = s))
+                        {
+                            _phase = LabPhase.Done;
+                            return;
+                        }
                     }
                     else
                     {

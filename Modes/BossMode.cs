@@ -287,6 +287,7 @@ namespace AutoExile.Modes
                 inventoryFragmentPath: _activeEncounter.InventoryFragmentPath,
                 stashItemThreshold: runSettings.StashItemThreshold.Value,
                 dumpTabName: string.IsNullOrWhiteSpace(stashSettings.DumpTabName.Value) ? null : stashSettings.DumpTabName.Value,
+                fallbackDumpTabName: string.IsNullOrWhiteSpace(stashSettings.FallbackDumpTabName.Value) ? null : stashSettings.FallbackDumpTabName.Value,
                 resourceTabName: string.IsNullOrWhiteSpace(stashSettings.FragmentTabName.Value) ? null : stashSettings.FragmentTabName.Value,
                 withdrawFragmentPath: _activeEncounter.InventoryFragmentPath,
                 fragmentStock: bossSettings.FragmentStock.Value,
@@ -636,8 +637,10 @@ namespace AutoExile.Modes
                     _runsCompleted++;
                     _mapCompleted = false;
                     _runStartTime = DateTime.Now;
+                    ctx.Log($"[Boss] Run {_runsCompleted} complete ({AvgRunTimeSeconds:F0}s avg)");
+                    if (ModeHelpers.FinishAndStopIfArmed(ctx, "Boss", s => Status = s))
+                        return;
                     StartHideoutFlow(ctx);
-                    ctx.Log($"[Boss] Run {_runsCompleted} complete ({AvgRunTimeSeconds:F0}s avg) — starting next");
                 }
                 else if (_deathCount > 0 && _deathCount < ctx.Settings.Run.MaxDeaths.Value)
                 {

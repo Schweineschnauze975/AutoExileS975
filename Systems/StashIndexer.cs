@@ -157,7 +157,7 @@ namespace AutoExile.Systems
             var key = currentIdx < _targetTabIndex ? System.Windows.Forms.Keys.Right : System.Windows.Forms.Keys.Left;
             BotInput.PressKey(key);
             _lastActionTime = DateTime.Now;
-            Status = $"Navigating to tab {_targetTabIndex + 1}/{_totalTabs}: {names[_targetTabIndex]}";
+            Status = $"Nav cur={currentIdx} tgt={_targetTabIndex} total={_totalTabs} key={key} '{names[_targetTabIndex]}'";
         }
 
         private void TickReadTab(GameController gc, ExileCore.PoEMemory.Elements.StashElement stashEl, IList<string> names)

@@ -15,6 +15,9 @@ namespace AutoExile
         public ToggleNode Running { get; set; } = new ToggleNode(false);
         public HotkeyNode ToggleRunning { get; set; } = new HotkeyNode(Keys.Insert);
 
+        [Menu("Finish And Stop Hotkey", "Hotkey to arm Finish & Stop. Press again to disarm it.")]
+        public HotkeyNode FinishAndStopHotkey { get; set; } = new HotkeyNode(Keys.None);
+
         [Menu("Test Map Explore", "Hotkey to start/restart map exploration test (navigate to beacon, fight, explore 70%).")]
         public HotkeyNode TestMapExplore { get; set; } = new HotkeyNode(Keys.F5);
 
@@ -202,11 +205,26 @@ namespace AutoExile
             [Menu("Blacklisted Enemies", "Comma-separated enemy render names to ignore globally. These monsters are excluded from all combat and seek-and-destroy logic.")]
             public TextNode BlacklistedEnemies { get; set; } = new TextNode("");
 
+            [Menu("Sell Exclusions", "Comma-separated item base names the currency-exchange seller must NEVER auto-sell.")]
+            public TextNode SellExclusions { get; set; } = new TextNode("Divine Orb, Stacked Deck, Scroll of Wisdom, Portal Scroll, Chaos Orb, Mirror of Kalandra, Simulacrum, Simulacrum Splinter");
+
+            [Menu("Sell Surplus Now", "Trigger a one-time currency-exchange sell run: walk to Faustus and sell surplus currency (>threshold, minus exclusions) for Chaos. Run this in your hideout. Auto-resets after starting.")]
+            public ToggleNode SellSurplusNow { get; set; } = new ToggleNode(false);
+
+            [Menu("Sell Max Orders / Run", "Safety cap on how many sell orders a single run places.")]
+            public RangeNode<int> SellMaxOrdersPerRun { get; set; } = new RangeNode<int>(3, 1, 10);
+
             [Menu("Default Positioning", "How to position relative to monsters. Modes can override.")]
             public ListNode DefaultPositioning { get; set; } = new ListNode();
 
             [Menu("Fight Range", "Preferred grid distance to fight monsters from. Melee/Ranged positioning target. Aggressive ignores this.")]
             public RangeNode<int> FightRange { get; set; } = new RangeNode<int>(40, 5, 80);
+
+            [Menu("Combat Strafe", "Never stand still in combat: continuously circle the monster pack at Fight Range instead of holding position. Keeps you a moving target (sidesteps ground effects) and self-corrects out of corners. Ideal for minion/totem builds that don't need to stand still to attack. Best with Ranged/Melee positioning.")]
+            public ToggleNode CombatStrafe { get; set; } = new ToggleNode(false);
+
+            [Menu("Boss Keep-Distance", "Grid distance to keep from Kosis & Omniphobia (Simulacrum bosses). The bot backs away to this range instead of standing in their melee, and won't re-approach. 0 = disabled.")]
+            public RangeNode<int> BossKeepDistance { get; set; } = new RangeNode<int>(0, 0, 120);
 
             [Menu("Combat Range", "Grid distance threshold for 'in combat'. Monsters within this trigger positioning and skills.")]
             public RangeNode<int> CombatRange { get; set; } = new RangeNode<int>(80, 20, 200);
@@ -1091,7 +1109,22 @@ namespace AutoExile
             public HotkeyNode PortalKey { get; set; } = new HotkeyNode(Keys.F);
 
             [Menu("Max Runtime (minutes)", "Stop the bot after this many minutes of *active* runtime (paused time doesn't count). 0 = no limit. Default 300 = 5 hours.")]
-            public RangeNode<int> MaxRuntimeMinutes { get; set; } = new RangeNode<int>(300, 0, 1440);
+            public RangeNode<int> MaxRuntimeMinutes { get; set; } = new RangeNode<int>(300, 0, 10080);
+
+            [Menu("Finish And Stop", "Finish the current run, return to hideout/town, then stop before starting the next run.")]
+            public ToggleNode FinishAndStop { get; set; } = new ToggleNode(false);
+
+            [Menu("Hideout Wait Timeout (minutes)", "If the bot stays in hideout too long while preparing/opening/entering a run, restart the hideout flow. 0 = disabled. Default 5 minutes.")]
+            public RangeNode<int> HideoutWaitTimeoutMinutes { get; set; } = new RangeNode<int>(5, 0, 60);
+
+            [Menu("Global Watchdog Enabled", "Detect long stalls across all modes and recover automatically.")]
+            public ToggleNode GlobalWatchdogEnabled { get; set; } = new ToggleNode(true);
+
+            [Menu("Global Watchdog Timeout (minutes)", "If no meaningful progress happens for this long, dump diagnostics and recover. 0 = disabled. Patrol movement alone does not count as progress.")]
+            public RangeNode<int> GlobalWatchdogTimeoutMinutes { get; set; } = new RangeNode<int>(10, 0, 60);
+
+            [Menu("Max Watchdog Recoveries", "Stop the bot after this many consecutive watchdog recoveries without meaningful progress. 0 = never stop automatically.")]
+            public RangeNode<int> MaxWatchdogRecoveries { get; set; } = new RangeNode<int>(3, 0, 10);
         }
 
         [Submenu(CollapsedByDefault = true)]
@@ -1150,6 +1183,9 @@ namespace AutoExile
         {
             [Menu("Dump Tab", "Stash tab to deposit bulk loot into (rares, uniques, currency, etc.). Empty = use current tab. Shared across all modes. Auto-populates with the live tab list after opening your stash once.")]
             public ListNode DumpTabName { get; set; } = new ListNode { Value = "" };
+
+            [Menu("Fallback Dump Tab", "Second stash tab to deposit loot into if the main dump tab appears full. Empty = disabled.")]
+            public ListNode FallbackDumpTabName { get; set; } = new ListNode { Value = "" };
 
             [Menu("Fragment Tab", "Stash tab to deposit/withdraw boss fragments and simulacrum splinters. For Boss/Simulacrum modes only. Should be a regular tab type — premium Fragment Stash sub-tab navigation is not supported yet.")]
             public ListNode FragmentTabName { get; set; } = new ListNode { Value = "" };

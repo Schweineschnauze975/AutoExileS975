@@ -89,5 +89,24 @@ namespace AutoExile.Modes.Shared
             BotInput.StopMovement();
             BotInput.ReleaseAllKeys();
         }
+
+        /// <summary>
+        /// Stop after a completed run without interrupting the map/lab that is already in progress.
+        /// Call this after a mode has returned to hideout/town and recorded the completed run.
+        /// </summary>
+        public static bool FinishAndStopIfArmed(BotContext ctx, string modeName, Action<string> setStatus)
+        {
+            if (!ctx.Settings.Run.FinishAndStop.Value) return false;
+
+            ctx.Settings.Run.FinishAndStop.Value = false;
+            ctx.Settings.Running.Value = false;
+            if (ctx.LootTracker.IsActive)
+                ctx.LootTracker.StopSession();
+
+            const string status = "Finish and stop complete - bot stopped";
+            setStatus(status);
+            ctx.Log($"[{modeName}] Finish and stop complete after current run");
+            return true;
+        }
     }
 }

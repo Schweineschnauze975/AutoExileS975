@@ -64,6 +64,9 @@ namespace AutoExile.Systems
         /// <summary>Nearest corpse position for offering skills (grid coords).</summary>
         public Vector2? NearestCorpse { get; private set; }
 
+        /// <summary>Nearest own minion to link (Flame Link etc.), grid target. Null if none in range.</summary>
+        public Entity? MinionToLink { get; private set; }
+
 
         /// <summary>Player HP percentage (0-1) last tick.</summary>
         public float HpPercent { get; private set; }
@@ -334,11 +337,13 @@ namespace AutoExile.Systems
             PackCenter = Vector2.Zero;
             DenseClusterCenter = Vector2.Zero;
             NearestCorpse = null;
+            MinionToLink = null;
             WantsToMove = false;
             LastAction = "";
             LastSkillAction = "";
             _walkableMonsterWeighted.Clear();
             _allMonsterWeighted.Clear();
+            _keepDistanceThreats.Clear();
             BestTargetHasLOS = false;
             _skillBar.Clear();
             _primaryMovementEntry = null;
@@ -375,6 +380,12 @@ namespace AutoExile.Systems
 
         /// <summary>Positions of all nearby monsters within chase radius (reused buffer).</summary>
         private readonly List<Vector2> _nearbyMonsterPositions = new();
+
+        /// <summary>Positions of alive keep-distance bosses (Kosis/Omniphobia) to kite away from (reused buffer).</summary>
+        private readonly List<Vector2> _keepDistanceThreats = new();
+
+        /// <summary>Current strafe direction (+1/-1) for orbiting keep-distance bosses; flips when blocked.</summary>
+        private int _bossOrbitDir = 1;
 
         /// <summary>Only monsters reachable via straight-line walk (pf LOS), with rarity weight for density.</summary>
         private readonly List<(Vector2 pos, float weight)> _walkableMonsterWeighted = new();
@@ -430,6 +441,7 @@ namespace AutoExile.Systems
             _nearbyMonsterPositions.Clear();
             _walkableMonsterWeighted.Clear();
             _allMonsterWeighted.Clear();
+            _keepDistanceThreats.Clear();
 
             // Use EntityCache.Monsters when available (pre-filtered, no type check needed).
             // Falls back to OnlyValidEntities if cache not wired up.
@@ -513,8 +525,24 @@ namespace AutoExile.Systems
                     if (pathBlocked) continue;
                 }
 
-                // Skip monsters blacklisted as unreachable (attacks don't connect)
-                if (_unreachableMonsters.Contains(entity.Id)) continue;
+                var closeCombatOverride = entity.IsTargetable && dist <= 18f;
+
+                // Skip monsters blacklisted as unreachable (attacks don't connect).
+                // A targetable monster standing on top of the player must be retried:
+                // Simulacrum bosses can get incorrectly marked unreachable mid-wave,
+                // and only clearing/restarting the wave used to recover them.
+                if (_unreachableMonsters.Contains(entity.Id) && !closeCombatOverride) continue;
+
+                // Phantom/stale guard: a real combatant exposes a Life component with positive HP.
+                // Decoration or stale-memory entities (often null RenderName, shown as "?") can
+                // register as hostile+alive and freeze the bot into "fighting 1 monster" with
+                // nothing there (e.g. the bridge end near the stash on Oriath's Delusion). Skip them.
+                var targetLife = entity.GetComponent<ExileCore.PoEMemory.Components.Life>();
+                if (targetLife == null || targetLife.CurHP <= 0) continue;
+
+                // Track designated keep-distance bosses (Kosis/Omniphobia) for kiting positioning.
+                if (IsKeepDistanceBoss(entity))
+                    _keepDistanceThreats.Add(entity.GridPosNum);
 
                 cachedCount++;
 
@@ -546,9 +574,8 @@ namespace AutoExile.Systems
                 bool isWalkable = pfGrid != null && Pathfinding.HasLineOfSight(pfGrid, playerGrid, entity.GridPosNum);
                 bool isTargetable = !isWalkable && tgtGrid != null &&
                     Pathfinding.HasTargetingLOS(tgtGrid, px, py, (int)entity.GridPosNum.X, (int)entity.GridPosNum.Y);
-
                 // Skip unreachable monsters (can't walk to AND can't shoot)
-                if (pfGrid != null && !isWalkable && !isTargetable)
+                if (pfGrid != null && !isWalkable && !isTargetable && !closeCombatOverride)
                 {
                     // Track nearest in-range monster blocked by LOS for repositioning
                     if (dist < nearestBlockedDist)
@@ -573,7 +600,7 @@ namespace AutoExile.Systems
                 };
 
                 // Track walkable monsters separately for positioning (don't walk into gaps)
-                if (isWalkable || pfGrid == null)
+                if (isWalkable || pfGrid == null || closeCombatOverride)
                     _walkableMonsterWeighted.Add((entity.GridPosNum, rarityWeight));
 
                 float score = rarityWeight - dist * 0.1f;
@@ -600,6 +627,30 @@ namespace AutoExile.Systems
                     bestTarget = entity;
                 }
             }
+
+            // ── Flame Link: nearest OWN minion, optionally skipping already-linked ones ──
+            // Your minions are non-hostile Monster entities. When a Minion-role skill has
+            // OnlyWhenBuffMissing + a buff name set, skip minions that already carry the buff so
+            // successive casts spread across all of them and go quiet once every minion is linked.
+            Entity? minionToLink = null;
+            {
+                var linkEntry = _skillBar.FirstOrDefault(e => e.Role == SkillRole.Minion);
+                if (linkEntry != null)
+                {
+                    string linkBuff = linkEntry.BuffDebuffName ?? "";
+                    bool gateByBuff = linkEntry.OnlyWhenBuffMissing && linkBuff.Length > 0;
+                    float nearestMinionDist = float.MaxValue;
+                    foreach (var m in monsters)
+                    {
+                        if (m.IsHostile || !m.IsAlive) continue;
+                        if (gateByBuff && EntityHasBuff(m, linkBuff)) continue;
+                        var md = Vector2.Distance(m.GridPosNum, playerGrid);
+                        if (md > combatRange) continue;
+                        if (md < nearestMinionDist) { nearestMinionDist = md; minionToLink = m; }
+                    }
+                }
+            }
+            MinionToLink = minionToLink;
 
             NearbyMonsterCount = combatCount;
             WeightedDensity = weightedDensity;
@@ -935,7 +986,7 @@ namespace AutoExile.Systems
         /// </summary>
         public static Keys DefaultKeyForSlot(int barPosition) => barPosition switch
         {
-            0 => Keys.None,        // LMB — move only
+            0 => Keys.LButton,     // LMB
             1 => Keys.RButton,     // RMB
             2 => Keys.MButton,     // Middle mouse
             3 => Keys.Q,
@@ -1007,7 +1058,7 @@ namespace AutoExile.Systems
             {
                 return (int)consoleKey switch
                 {
-                    1 => Keys.None,      // LMB — move only, don't bind
+                    1 => Keys.LButton,   // LMB
                     2 => Keys.RButton,   // RMB
                     4 => Keys.MButton,   // MMB
                     _ => Keys.None
@@ -1090,31 +1141,60 @@ namespace AutoExile.Systems
             if (!BotInput.CanAct) return false;
             if ((DateTime.Now - _lastSkillUseAt).TotalMilliseconds < MinSkillIntervalMs) return false;
 
+            string? firstSkipReason = null;
+            bool sawCombatSkill = false;
             foreach (var entry in _skillBar)
             {
                 // Self-role already handled by TickSelfSkills
                 if (entry.Role == SkillRole.Self) continue;
+                sawCombatSkill = true;
 
                 // Universal gate: game says skill can't be used (cooldown/mana/souls)
-                if (entry.Skill != null && !entry.Skill.CanBeUsed) continue;
+                if (entry.Skill != null && !entry.Skill.CanBeUsed)
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: CanBeUsed=false";
+                    continue;
+                }
 
                 // Suppress cursor-moving skills during loot pickup to avoid cursor interference
                 if (SuppressTargetedSkills && (entry.Role == SkillRole.Enemy || entry.Role == SkillRole.Corpse))
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: suppressed by loot";
                     continue;
+                }
 
                 // Targeting prerequisite: Enemy needs a target, Corpse needs a corpse
-                if (entry.Role == SkillRole.Enemy && (BestTarget == null || !InCombat)) continue;
-                if (entry.Role == SkillRole.Corpse && !NearestCorpse.HasValue) continue;
+                if (entry.Role == SkillRole.Enemy && (BestTarget == null || !InCombat))
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: no enemy target";
+                    continue;
+                }
+                if (entry.Role == SkillRole.Corpse && !NearestCorpse.HasValue)
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: no corpse";
+                    continue;
+                }
+                if (entry.Role == SkillRole.Minion && MinionToLink == null)
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: no minion target";
+                    continue;
+                }
 
                 // All "when to fire" logic is in conditions
-                if (!CheckSkillConditions(gc, entry, settings)) continue;
+                if (!CheckSkillConditions(gc, entry, settings, out var skipReason))
+                {
+                    firstSkipReason ??= $"{SkillLabel(entry)}: {skipReason}";
+                    continue;
+                }
 
                 var targetGridPos = GetSkillTargetGrid(gc, entry);
                 UseSkill(gc, entry, targetGridPos);
                 return true;
             }
 
-            LastSkillAction = "no skill ready";
+            LastSkillAction = !sawCombatSkill
+                ? "no configured combat skills"
+                : firstSkipReason ?? "no skill ready";
             return false;
         }
 
@@ -1123,14 +1203,27 @@ namespace AutoExile.Systems
         /// </summary>
         private bool CheckSkillConditions(GameController gc, SkillBarEntry entry, BotSettings.BuildSettings settings)
         {
+            return CheckSkillConditions(gc, entry, settings, out _);
+        }
+
+        private bool CheckSkillConditions(GameController gc, SkillBarEntry entry, BotSettings.BuildSettings settings, out string skipReason)
+        {
+            skipReason = "";
             // Per-skill cast interval — prevents debuffs from overriding primary attacks
             if (entry.MinCastIntervalMs > 0 &&
                 (DateTime.Now - entry.LastCastAt).TotalMilliseconds < entry.MinCastIntervalMs)
+            {
+                skipReason = $"waiting {entry.MinCastIntervalMs}ms interval";
                 return false;
+            }
 
             // Require targetable — skip if target is invulnerable/untargetable
-            if (entry.RequireTargetable && BestTarget != null && !BestTarget.IsTargetable)
+            if (entry.RequireTargetable && BestTarget != null && !BestTarget.IsTargetable &&
+                !IsCloseUniqueTarget(gc, BestTarget))
+            {
+                skipReason = "target not targetable";
                 return false;
+            }
 
             // Target filter — restrict to certain rarities
             if (entry.TargetFilter != SkillTargetFilter.Any && BestTarget != null)
@@ -1138,15 +1231,24 @@ namespace AutoExile.Systems
                 var rarity = BestTarget.Rarity;
                 if (entry.TargetFilter == SkillTargetFilter.RareOrAbove &&
                     rarity != MonsterRarity.Rare && rarity != MonsterRarity.Unique)
+                {
+                    skipReason = $"target is {rarity}, needs rare+";
                     return false;
+                }
                 if (entry.TargetFilter == SkillTargetFilter.UniqueOnly &&
                     rarity != MonsterRarity.Unique)
+                {
+                    skipReason = $"target is {rarity}, needs unique";
                     return false;
+                }
             }
 
             // Min nearby enemies
             if (entry.MinNearbyEnemies > 0 && NearbyMonsterCount < entry.MinNearbyEnemies)
+            {
+                skipReason = $"{NearbyMonsterCount}/{entry.MinNearbyEnemies} nearby";
                 return false;
+            }
 
             // Buff/debuff presence check
             if (entry.OnlyWhenBuffMissing)
@@ -1156,18 +1258,32 @@ namespace AutoExile.Systems
                 if (entry.Role == SkillRole.Enemy && BestTarget != null)
                 {
                     if (HasDebuffOnTarget(BestTarget, entry.BuffDebuffName.Length > 0 ? entry.BuffDebuffName : entry.Skill?.InternalName ?? ""))
+                    {
+                        skipReason = "debuff already present";
                         return false;
+                    }
+                }
+                else if (entry.Role == SkillRole.Minion)
+                {
+                    // Minion buff gating is handled during target selection (MinionToLink already
+                    // excludes minions that carry the buff) — don't check player buffs here.
                 }
                 else
                 {
                     if (HasBuff(gc, entry.Skill, entry.BuffDebuffName))
+                    {
+                        skipReason = "buff already present";
                         return false;
+                    }
                 }
             }
 
             // Only on low life
             if (entry.OnlyOnLowLife && HpPercent >= settings.GuardHpThreshold.Value)
+            {
+                skipReason = $"hp {HpPercent:P0} above guard threshold";
                 return false;
+            }
 
             // Close enemies / max target range
             if (entry.MaxTargetRange > 0 && BestTarget != null)
@@ -1175,14 +1291,20 @@ namespace AutoExile.Systems
                 var playerGrid = gc.Player.GridPosNum;
                 var dist = Vector2.Distance(playerGrid, BestTarget.GridPosNum);
                 if (dist > entry.MaxTargetRange)
+                {
+                    skipReason = $"target range {dist:F0}>{entry.MaxTargetRange}";
                     return false;
+                }
             }
 
             // Summon recast — skip if enough minions deployed nearby
             if (entry.SummonRecast && entry.Skill != null)
             {
                 if (!ShouldResummon(entry.Skill, entry.Role, settings))
+                {
+                    skipReason = "summon count already enough";
                     return false;
+                }
             }
 
             return true;
@@ -1194,9 +1316,23 @@ namespace AutoExile.Systems
             {
                 SkillRole.Enemy => BestTarget?.GridPosNum,
                 SkillRole.Corpse => NearestCorpse,
+                SkillRole.Minion => MinionToLink?.GridPosNum,
                 SkillRole.Self => null,
                 _ => null
             };
+        }
+
+        private string SkillLabel(SkillBarEntry entry)
+        {
+            return entry.Skill?.Name ?? entry.Key.ToString();
+        }
+
+        private static bool IsCloseUniqueTarget(GameController gc, Entity target)
+        {
+            if (target.Rarity != MonsterRarity.Unique || gc.Player == null)
+                return false;
+
+            return Vector2.Distance(gc.Player.GridPosNum, target.GridPosNum) <= 18f;
         }
 
         private void UseSkill(GameController gc, SkillBarEntry entry, Vector2? gridTarget)
@@ -1473,12 +1609,90 @@ namespace AutoExile.Systems
         // Positioning — uses cursor + move key, never clicks
         // ═══════════════════════════════════════════════════
 
+        /// <summary>
+        /// Compute a tangential "strafe" target that circles <paramref name="center"/> at
+        /// <paramref name="radius"/> grid units while keeping targeting LOS to it. Reverses the
+        /// orbit direction when the chosen spot is blocked (wall / arena edge) and shoves
+        /// straight out if boxed in too close. Returns null if nothing walkable is found.
+        /// Shared by the boss orbit and the general Combat-Strafe behavior so both inherit the
+        /// same wall-/corner-avoidance. Uses/updates the persistent _bossOrbitDir strafe sign.
+        /// </summary>
+        private Vector2? OrbitAround(BotContext ctx, Vector2 center, float radius)
+        {
+            var gc = ctx.Game;
+            var pGrid = gc.Player.GridPosNum;
+            var radial = pGrid - center;
+            float curR = radial.Length();
+            var radialDir = curR > 0.001f ? radial / curR : new Vector2(1f, 0f);
+            var pf = gc.IngameState.Data.RawFramePathfindingData;
+            float step = MathF.Min(radius * 0.5f, 18f);
+
+            Vector2? chosen = null;
+            for (int attempt = 0; attempt < 2 && !chosen.HasValue; attempt++)
+            {
+                var tangent = new Vector2(-radialDir.Y, radialDir.X) * _bossOrbitDir;
+                var target = pGrid + tangent * step + radialDir * (radius - curR);
+                var cand = ctx.Navigation.FindWalkableWithLOS(gc, target, center, 20);
+                if (cand.HasValue && (pf == null || Pathfinding.HasLineOfSight(pf, pGrid, cand.Value)))
+                    chosen = cand;
+                else
+                    _bossOrbitDir = -_bossOrbitDir; // spot blocked — reverse next try
+            }
+
+            // Boxed in but too close — shove straight out from the center as a last resort.
+            if (!chosen.HasValue && curR < radius)
+            {
+                var outTarget = pGrid + radialDir * (radius - curR + 10f);
+                chosen = ctx.Navigation.FindWalkableWithLOS(gc, outTarget, center, 20)
+                      ?? ctx.Navigation.FindWalkableWithLOS(gc, pGrid, center, 20);
+            }
+            return chosen;
+        }
+
         private void TickPositioning(BotContext ctx)
         {
             var gc = ctx.Game;
             var settings = ctx.Settings.Build;
 
             if (BestTarget == null || NearbyMonsterCount == 0) return;
+
+            // ── Orbit designated bosses (Kosis / Omniphobia) ──
+            // Standing at range still dies to their frontal attacks, which track the player. So
+            // instead of holding, STRAFE around the boss: move sideways (tangent) while correcting
+            // radius back to the keep-distance ring. Constant lateral motion walks the player out
+            // of frontal cones and forces the boss to keep re-facing. Orbit the centroid so both
+            // bosses alive at once are handled; reverse strafe direction when the spot is blocked
+            // (wall / arena edge), and shove straight out only if boxed in while too close.
+            int bossKeepDist = settings.BossKeepDistance.Value;
+            if (bossKeepDist > 0 && _keepDistanceThreats.Count > 0)
+            {
+                var pGrid = gc.Player.GridPosNum;
+                Vector2 center = Vector2.Zero;
+                float nearestThreat = float.MaxValue;
+                foreach (var t in _keepDistanceThreats)
+                {
+                    center += t;
+                    float d = Vector2.Distance(pGrid, t);
+                    if (d < nearestThreat) nearestThreat = d;
+                }
+                center /= _keepDistanceThreats.Count;
+
+                // Only orbit while actually near a boss; otherwise let normal positioning approach.
+                if (nearestThreat <= settings.CombatRange.Value)
+                {
+                    var chosen = OrbitAround(ctx, center, bossKeepDist);
+                    if (chosen.HasValue)
+                    {
+                        WantsToMove = true;
+                        MoveTargetGrid = chosen.Value;
+                        MoveTarget = ToWorld(chosen.Value);
+                        ExecuteMove(gc, chosen.Value);
+                        LastAction = $"orbiting boss (dir={_bossOrbitDir})";
+                        return;
+                    }
+                    // Nothing walkable — fall through to normal positioning.
+                }
+            }
 
             // If no walkable monsters exist, handle gap-only combat
             if (_walkableMonsterWeighted.Count == 0)
@@ -1493,6 +1707,27 @@ namespace AutoExile.Systems
             var playerGrid = gc.Player.GridPosNum;
             float dist = Vector2.Distance(playerGrid, DenseClusterCenter);
             float fightRange = settings.FightRange.Value;
+
+            // ── Active combat strafe (opt-in): never stand still ──
+            // Generalizes the boss-orbit strafe to ALL combat — continuously circle the pack at
+            // Fight Range instead of holding position, so the character is a moving target and
+            // can't get pinned in a corner (shared reverse-on-block + shove-out logic). We drive
+            // the move directly via ExecuteMove and deliberately do NOT set WantsToMove: that
+            // signal makes Aggressive-positioning modes launch their own A* to the target, which
+            // would fight the direct cursor-walk. Falls through to normal positioning only when
+            // no walkable strafe spot exists.
+            if (settings.CombatStrafe.Value)
+            {
+                var strafe = OrbitAround(ctx, DenseClusterCenter, fightRange);
+                if (strafe.HasValue)
+                {
+                    MoveTargetGrid = strafe.Value;
+                    MoveTarget = ToWorld(strafe.Value);
+                    ExecuteMove(gc, strafe.Value);
+                    LastAction = $"strafing pack (r={fightRange:F0} dir={_bossOrbitDir})";
+                    return;
+                }
+            }
 
             Vector2? desiredGridPos = null;
 
@@ -1786,6 +2021,19 @@ namespace AutoExile.Systems
             return false;
         }
 
+        /// <summary>
+        /// Bosses the bot should kite away from instead of standing in melee (squishy builds).
+        /// Matched by display name so it stays specific to Kosis &amp; Omniphobia.
+        /// </summary>
+        private static bool IsKeepDistanceBoss(Entity entity)
+        {
+            if (entity.Rarity != MonsterRarity.Unique) return false;
+            var name = entity.RenderName;
+            if (string.IsNullOrEmpty(name)) return false;
+            return name.Contains("Kosis", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("Omniphobia", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static bool IsInsideMonolith(Entity entity)
         {
             try
@@ -1868,6 +2116,7 @@ namespace AutoExile.Systems
         Enemy,              // Aim at best hostile target (attacks, curses, debuffs, warcries)
         Corpse,             // Aim at nearest corpse (offerings, detonate dead)
         Self,               // No cursor needed — self-cast (buffs, guards, vaal, summons)
+        Minion,             // Aim at nearest own minion (link skills — Flame/Protective/etc.)
     }
 
     public enum SkillTargetFilter

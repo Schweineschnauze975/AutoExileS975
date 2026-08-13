@@ -1084,6 +1084,7 @@ namespace AutoExile.WebServer
         public string Decision { get; init; } = "";
         public string Status { get; init; } = "";
         public string Area { get; init; } = "";
+        public bool FinishAndStop { get; init; }
 
         public float HpPercent { get; init; }
         public float EsPercent { get; init; }
@@ -1113,6 +1114,9 @@ namespace AutoExile.WebServer
         public int RuntimeActiveSeconds { get; init; }
         public int RuntimeRemainingSeconds { get; init; } // 0 when expired or no limit
         public int RuntimeMaxMinutes { get; init; }
+        public string WatchdogStatus { get; init; } = "";
+        public int WatchdogRecoveries { get; init; }
+        public int WatchdogLastProgressSeconds { get; init; }
 
         // Simulacrum stats (populated only when mode is Simulacrum)
         public int SimWave { get; init; }

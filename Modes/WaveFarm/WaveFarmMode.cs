@@ -478,6 +478,8 @@ namespace AutoExile.Modes.WaveFarm
                 stashItemThreshold: 0,
                 dumpTabName:     string.IsNullOrWhiteSpace(stash.DumpTabName.Value)
                                     ? null : stash.DumpTabName.Value,
+                fallbackDumpTabName: string.IsNullOrWhiteSpace(stash.FallbackDumpTabName.Value)
+                                    ? null : stash.FallbackDumpTabName.Value,
                 resourceTabName: string.IsNullOrWhiteSpace(stash.MappingSuppliesTabName.Value)
                                     ? null : stash.MappingSuppliesTabName.Value,
                 withdrawList: withdrawals,
@@ -933,8 +935,10 @@ namespace AutoExile.Modes.WaveFarm
                 {
                     _mapCompleted = false;
                     _runsCompleted++;
-                    StartHideoutFlow(ctx);
                     ctx.Log($"[WaveFarm] Run #{_runsCompleted} complete");
+                    if (ModeHelpers.FinishAndStopIfArmed(ctx, "WaveFarm", s => Status = s))
+                        return;
+                    StartHideoutFlow(ctx);
                 }
                 else
                 {

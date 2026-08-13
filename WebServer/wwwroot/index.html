@@ -244,14 +244,16 @@ tr:hover td { background:var(--surface2); }
       <div class="bot-status">
         <div id="statusDot" class="status-dot"></div>
         <span id="botStatusText">Stopped</span>
+        <span id="finishStopBadge" class="connection-badge" style="display:none;border-color:var(--orange);color:var(--orange)">Finish & Stop</span>
       </div>
       <div class="controls">
         <select id="modeSelect" class="mode-select">
           <option>Idle</option><option>Wave Farming</option><option>Simulacrum</option>
           <option>Blight</option><option value="Heist">Heist (WIP)</option><option>Labyrinth</option>
-          <option>Follower</option><option>Boss</option>
+          <option>Follower</option><option>Boss</option><option>Sell</option>
         </select>
         <button class="btn primary" onclick="sendCmd('start')">Start</button>
+        <button id="finishStopBtn" class="btn" onclick="sendCmd('finishStop')">Finish & Stop</button>
         <button class="btn danger" onclick="sendCmd('stop')">Stop</button>
       </div>
     </div>
@@ -389,7 +391,15 @@ tr:hover td { background:var(--surface2); }
         <span id="runtimeRemaining" style="font-size:12px;color:var(--text-dim)">no limit</span>
       </div>
       <div class="bar"><div id="runtimeBar" class="bar-fill" style="width:0%;background:var(--accent)"></div></div>
-      <button class="btn" style="margin-top:10px;padding:5px 12px;font-size:11px" onclick="resetRuntime()">Reset Timer</button>
+      <div style="display:flex;align-items:end;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <label style="font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-dim)">
+          Max Minutes
+          <input id="runtimeMaxInput" type="number" min="0" max="10080" step="1" value="0"
+            onchange="setRuntimeMax(this.value)"
+            style="display:block;width:90px;margin-top:4px;padding:5px 8px;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:12px">
+        </label>
+        <button class="btn" style="padding:5px 12px;font-size:11px" onclick="resetRuntime()">Reset Timer</button>
+      </div>
     </div>
     <div class="card">
       <h2>Combat & Navigation</h2>
@@ -398,6 +408,7 @@ tr:hover td { background:var(--surface2); }
         <div class="stat"><div class="stat-label">Monsters</div><div id="monsters" class="stat-value accent">0</div></div>
         <div class="stat"><div class="stat-label">Target</div><div id="combatTarget" class="stat-value" style="font-size:14px">--</div></div>
         <div class="stat"><div class="stat-label">Navigation</div><div id="navStatus" class="stat-value" style="font-size:14px">Idle</div></div>
+        <div class="stat"><div class="stat-label">Watchdog</div><div id="watchdogStatus" class="stat-value" style="font-size:13px">OK</div></div>
       </div>
     </div>
     <div id="explorationCard" class="card">
@@ -559,6 +570,7 @@ function updateDashboard(s) {
   if (!s.inGame) { dot.className='status-dot'; txt.textContent='Not In Game'; }
   else if (s.running) { dot.className='status-dot running'; txt.textContent=`${s.mode}${s.phase?' - '+s.phase:''}`; }
   else { dot.className='status-dot paused'; txt.textContent='Paused'; }
+  setFinishStopUi(!!s.finishAndStop);
 
   document.getElementById('areaName').textContent = s.area || '--';
   updateRuntimeWidget(s);
@@ -572,6 +584,12 @@ function updateDashboard(s) {
   const ne = document.getElementById('navStatus');
   if (s.isNavigating) { ne.textContent=`${s.waypointIndex+1}/${s.waypointTotal}`; ne.className='stat-value accent'; }
   else { ne.textContent='Idle'; ne.className='stat-value'; }
+  const wd = document.getElementById('watchdogStatus');
+  if (wd) {
+    const idle = s.watchdogLastProgressSeconds || 0;
+    wd.textContent = s.watchdogStatus || `OK ${fmtHM(idle)}`;
+    wd.className = (s.watchdogRecoveries || 0) > 0 ? 'stat-value orange' : 'stat-value';
+  }
 
   document.getElementById('coverage').textContent = (s.explorationCoverage*100).toFixed(1)+'%';
   document.getElementById('regions').textContent = s.explorationRegions;
@@ -702,6 +720,19 @@ function updateDashboard(s) {
   if (s.status && s.status !== lastStatus) { addLog('status',s.status); lastStatus=s.status; }
 }
 
+function setFinishStopUi(armed) {
+  const badge = document.getElementById('finishStopBadge');
+  const btn = document.getElementById('finishStopBtn');
+  if (badge) badge.style.display = armed ? '' : 'none';
+  if (btn) {
+    btn.classList.toggle('primary', armed);
+    btn.textContent = armed ? 'Finish & Stop Armed' : 'Finish & Stop';
+  }
+  if (S['run.finishAndStop']) S['run.finishAndStop'].value = armed;
+  const row = document.querySelector('[data-key="run.finishAndStop"] input[type="checkbox"]');
+  if (row) row.checked = armed;
+}
+
 function setBar(id,pct) { const p=Math.round(pct*100); document.getElementById(id+'Bar').style.width=p+'%'; document.getElementById(id+'Text').textContent=p+'%'; }
 
 function fmtHM(seconds) {
@@ -715,6 +746,7 @@ function updateRuntimeWidget(s) {
   const elapsedEl   = document.getElementById('runtimeElapsed');
   const remainingEl = document.getElementById('runtimeRemaining');
   const barEl       = document.getElementById('runtimeBar');
+  const maxInput    = document.getElementById('runtimeMaxInput');
   if (!elapsedEl) return;
 
   const active = s.runtimeActiveSeconds || 0;
@@ -722,6 +754,8 @@ function updateRuntimeWidget(s) {
   const left   = s.runtimeRemainingSeconds || 0;
 
   elapsedEl.textContent = fmtHM(active);
+  if (maxInput && !maxInput.matches(':focus'))
+    maxInput.value = max;
 
   if (max <= 0) {
     remainingEl.textContent = 'no limit';
@@ -746,6 +780,13 @@ function updateRuntimeWidget(s) {
   remainingEl.textContent = left > 0
     ? `${fmtHM(left)} remaining (cap ${Math.floor(max/60)}:${(max%60).toString().padStart(2,'0')})`
     : `expired — bot stopped`;
+}
+
+async function setRuntimeMax(value) {
+  const parsed = Math.max(0, Math.min(10080, parseInt(value || '0', 10) || 0));
+  const input = document.getElementById('runtimeMaxInput');
+  if (input) input.value = parsed;
+  await updateSetting('run.maxRuntimeMinutes', parsed);
 }
 
 async function resetRuntime() {
@@ -909,7 +950,13 @@ function buildMustLootUniques() {
     searchTimer = setTimeout(async () => {
       try {
         const r = await fetch(`/api/ninja/uniques?q=${encodeURIComponent(q)}`);
-        if (!r.ok) return;
+        if (!r.ok) {
+          let msg = 'Price data not loaded yet';
+          try { const err = await r.json(); if (err && err.error) msg = err.error; } catch {}
+          dropdown.innerHTML = `<div class="autocomplete-item" style="color:var(--text-dim)">${esc(msg)}</div>`;
+          dropdown.classList.add('show');
+          return;
+        }
         const results = await r.json();
         dropdown.innerHTML = '';
         if (results.length === 0) {
@@ -1031,6 +1078,8 @@ function buildEnemyBlacklist() {
 
 // ==================== COMMANDS ====================
 async function sendCmd(action, value) {
+  if (action === 'finishStop') setFinishStopUi(true);
+  if (action === 'start' || action === 'stop') setFinishStopUi(false);
   try { await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,value})}); } catch {}
 }
 document.getElementById('modeSelect').addEventListener('change', function(){
@@ -1122,6 +1171,7 @@ const SKILL_TYPES = {
   vaal:     { label:'Vaal Skill', role:'Self', fields:['priority','minNearbyEnemies'], defaults:{priority:6, minNearbyEnemies:5} },
   warcry:   { label:'Warcry', role:'Enemy', fields:['priority','minNearbyEnemies','minCastIntervalMs','requireTargetable'], defaults:{priority:4, minNearbyEnemies:3} },
   summon:   { label:'Summon / Minion', role:'Self', fields:['priority'], defaults:{priority:5, summonRecast:true} },
+  link:     { label:'Link (minion)', role:'Minion', fields:['priority','minCastIntervalMs','buffDebuffName'], defaults:{priority:6, onlyWhenBuffMissing:true, minCastIntervalMs:300} },
   corpse:   { label:'Corpse Skill', role:'Corpse', fields:['priority','buffDebuffName'], defaults:{priority:5, onlyWhenBuffMissing:true} },
   totem:    { label:'Totem', role:'Enemy', fields:['priority','minNearbyEnemies','maxTargetRange','requireTargetable'], defaults:{priority:6, summonRecast:true, minNearbyEnemies:1} },
   custom:   { label:'Custom', role:null, fields:['role','priority','canCrossTerrain','targetFilter','maxTargetRange','minNearbyEnemies','minCastIntervalMs','onlyWhenBuffMissing','buffDebuffName','onlyOnLowLife','summonRecast','requireTargetable','isChannel'], defaults:{} },
@@ -1196,6 +1246,7 @@ const MODE_SETTINGS = {
   Labyrinth:   { sections: ['labyrinth'], mechanics: [] },
   Boss:        { sections: ['boss'], mechanics: [] },
   Follower:    { sections: ['follower'], mechanics: [] },
+  Sell:        { sections: [], mechanics: [] },
 };
 
 let currentBotMode = 'Idle';
@@ -1246,13 +1297,13 @@ function renderModeTab(container, modeName) {
         ['mapDevice.slot3'],['mapDevice.slot4'],['mapDevice.slot5']]);
       addSection(container, 'Run (shared)', [['run.portalKey'],['run.maxDeaths'],
         ['run.stashItemThreshold'],['run.lootSweepTimeoutSeconds']]);
-      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.mappingSuppliesTabName']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fallbackDumpTabName'],['stash.mappingSuppliesTabName']]);
     } else if (section === 'simulacrum') {
       addSection(container, 'Simulacrum', [['simulacrum.simulacrumStock'],
         ['simulacrum.minWaveDelaySeconds'],['simulacrum.waveTimeoutMinutes']]);
       addSection(container, 'Run (shared)', [['run.maxDeaths'],['run.stashItemThreshold'],
         ['run.lootSweepTimeoutSeconds'],['run.portalKey']]);
-      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fragmentTabName']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fallbackDumpTabName'],['stash.fragmentTabName']]);
     } else if (section === 'blight') {
       const blightDiv = document.createElement('div');
       const blightTitle = document.createElement('div'); blightTitle.className='section-divider'; blightTitle.textContent='Blight'; blightDiv.appendChild(blightTitle);
@@ -1288,7 +1339,7 @@ function renderModeTab(container, modeName) {
       addSection(container, 'Boss', [['boss.bossType'],['boss.fragmentStock'],['boss.keyDropChaosValue']]);
       addSection(container, 'Run (shared)', [['run.maxDeaths'],['run.lootSweepTimeoutSeconds'],
         ['run.stashItemThreshold'],['run.portalKey']]);
-      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fragmentTabName']]);
+      addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fallbackDumpTabName'],['stash.fragmentTabName']]);
     } else if (section === 'follower') {
       addSection(container, 'Follower', [['follower.leaderName'],['follower.followDistance'],['follower.stopDistance'],
         ['follower.followThroughTransitions'],['follower.enableCombat'],['follower.enableLoot'],['follower.lootNearLeaderOnly']]);
@@ -1402,9 +1453,11 @@ function renderAllSettings() {
   // Build tab
   const build = makeTabContent('build', activeSettingsTab === 'build');
   addSection(build, 'Movement', [['build.blinkRange'],['build.dashMinDistance','0 = disable dash-for-speed'],['build.pathMergeThreshold','0 = disabled']]);
-  addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatRange'],
+  addSection(build, 'Combat', [['build.defaultPositioning'],['build.fightRange'],['build.combatStrafe','circle packs at Fight Range instead of standing still'],['build.bossKeepDistance','0 = off; ~45 kites Kosis/Omniphobia'],['build.combatRange'],
     ['build.guardHpThreshold'],['build.guardEsThreshold'],['build.vaalMinMonsters'],['build.summonExpectedCount']]);
   build.appendChild(buildEnemyBlacklist());
+  build.appendChild(buildTagListEditor('build.sellExclusions', 'Sell Exclusions (never auto-sell)', 'e.g. Divine Orb'));
+  addSection(build, 'Sell Surplus (currency exchange)', [['build.sellMaxOrdersPerRun','select the "Sell" mode in your hideout + Insert to run']]);
   build.appendChild(renderSkillsSection());
   addSection(build, 'Flasks', [['build.flasksEnabled'],['build.lifeFlaskSlot','0 = disabled'],['build.lifeFlaskHpThreshold'],
     ['build.manaFlaskSlot','0 = disabled'],['build.manaFlaskManaThreshold'],['build.utilityFlaskIntervalMs']]);
@@ -1442,12 +1495,13 @@ function renderAllSettings() {
 
   // Advanced tab
   const adv = makeTabContent('advanced', activeSettingsTab === 'advanced');
+  addSection(adv, 'Run Control', [['run.maxDeaths'],['run.stashItemThreshold'],['run.lootSweepTimeoutSeconds'],['run.portalKey'],['run.maxRuntimeMinutes'],['run.finishAndStop'],['run.hideoutWaitTimeoutMinutes'],['run.globalWatchdogEnabled'],['run.globalWatchdogTimeoutMinutes'],['run.maxWatchdogRecoveries']]);
   addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['areaSettleSeconds'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
   addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
     ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);
   addSection(adv, 'Web UI', [['webUiEnabled'],['webUiPort']]);
-  addSection(adv, 'Hotkeys', [['toggleRunning'],['testMapExplore'],['dumpGameState'],['dumpRecording']]);
+  addSection(adv, 'Hotkeys', [['toggleRunning'],['finishAndStopHotkey'],['testMapExplore'],['dumpGameState'],['dumpRecording']]);
   c.appendChild(adv);
 
   switchSettingsTab(activeSettingsTab);
@@ -1924,7 +1978,7 @@ function buildField(key, entry, note) {
       }
       break;
     case 'hotkey': {
-      const commonKeys = ['None','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+      const commonKeys = ['None','LButton','RButton','MButton','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
         'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
         'D0','D1','D2','D3','D4','D5','D6','D7','D8','D9',
         'Insert','Delete','Home','End','PageUp','PageDown',
