@@ -1324,9 +1324,20 @@ namespace AutoExile
 
             if (needsRefresh && currentHash != 0)
             {
-                var pfGrid = GameController.IngameState?.Data?.RawPathfindingData;
-                var tgtGrid = GameController.IngameState?.Data?.RawTerrainTargetingData;
-                var terrain = MapRenderer.BuildTerrainData(pfGrid, tgtGrid, _exploration);
+                // Split into two Perf sections so the Debug Perf Overlay (Follower/Wave Farm) can
+                // show whether a stutter here comes from reading the raw grids out of ExileCore
+                // (terrainFetch) or from AutoExile's own bounds-scan/encoding (terrainBuild).
+                int[][]? pfGrid, tgtGrid;
+                using (_ctx.Perf.SectionScope("webserver.terrainFetch"))
+                {
+                    pfGrid = GameController.IngameState?.Data?.RawPathfindingData;
+                    tgtGrid = GameController.IngameState?.Data?.RawTerrainTargetingData;
+                }
+
+                MapTerrainData? terrain;
+                using (_ctx.Perf.SectionScope("webserver.terrainBuild"))
+                    terrain = MapRenderer.BuildTerrainData(pfGrid, tgtGrid, _exploration);
+
                 if (terrain != null)
                 {
                     _webServer.UpdateTerrain(terrain, currentHash);

@@ -1173,6 +1173,45 @@ namespace AutoExile.Modes
                     }
                 }
             }
+
+            // Performance overlay (opt-in — off by default). Same panel as WaveFarmMode's; ctx.Perf
+            // is a single tracker shared across the whole plugin, so sections recorded anywhere
+            // (e.g. BotCore's webserver.terrainFetch/terrainBuild) show up here too — this just
+            // makes the panel visible while Follower is the active mode instead of only Wave Farm.
+            if (ctx.Settings.DebugPerfOverlay.Value)
+            {
+                var dim = new SharpDX.Color(180, 180, 180, 255);
+                var bright = SharpDX.Color.White;
+                var warn = SharpDX.Color.Yellow;
+                var bad = SharpDX.Color.OrangeRed;
+
+                hudY += lineH / 2;
+                gfx.DrawText("── Perf (ms) avg / p95 / max ──", new Vector2(hudX, hudY), bright);
+                hudY += lineH;
+                foreach (var (name, st) in ctx.Perf.TopSections(8))
+                {
+                    var c = st.MaxMs > 20 ? bad : st.MaxMs > 8 ? warn : dim;
+                    gfx.DrawText($"  {name,-26} {st.AvgMs,5:F2} / {st.P95Ms,5:F2} / {st.MaxMs,5:F2}  (n={st.Count})",
+                        new Vector2(hudX, hudY), c);
+                    hudY += lineH;
+                }
+
+                var lootSkipTotal = ctx.Perf.FailureTotal("lootSkip");
+                var lootTotal = ctx.Perf.FailureTotal("loot");
+                var interactTotal = ctx.Perf.FailureTotal("interact");
+                var exploreTotal = ctx.Perf.FailureTotal("explore");
+                gfx.DrawText($"── Failures — lootSkip:{lootSkipTotal}  lootClick:{lootTotal}  interact:{interactTotal}  explore:{exploreTotal} ──",
+                    new Vector2(hudX, hudY), bright);
+                hudY += lineH;
+                foreach (var cat in new[] { "loot", "interact", "lootSkip", "explore" })
+                {
+                    foreach (var (reason, count) in ctx.Perf.TopFailures(cat, 3))
+                    {
+                        gfx.DrawText($"  [{cat}] {reason}: {count}", new Vector2(hudX, hudY), warn);
+                        hudY += lineH;
+                    }
+                }
+            }
         }
     }
 
