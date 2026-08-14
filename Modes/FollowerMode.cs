@@ -43,6 +43,13 @@ namespace AutoExile.Modes
         private bool _hasLastLeaderPos;
         private string _lastAreaName = "";
 
+        // Leader entity found this Tick() — reused by Render() for the leader marker so the
+        // same full entity-list search isn't repeated a second time within the same frame.
+        // Only refreshed when Tick() actually reaches the FindLeader() call below (not during
+        // loading screens / in-progress transition clicks, where an extra frame of staleness
+        // on a purely cosmetic marker doesn't matter).
+        private Entity? _lastKnownLeader;
+
         // Leader velocity tracking — smoothed over several ticks for prediction
         private Vector2 _leaderVelocity; // grid units per second
         private DateTime _lastLeaderSampleTime = DateTime.MinValue;
@@ -224,6 +231,7 @@ namespace AutoExile.Modes
 
             // Try to find the leader entity
             var leader = FindLeader(gc);
+            _lastKnownLeader = leader;
 
             if (leader != null)
             {
@@ -1127,8 +1135,9 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
-            // Draw leader marker if visible
-            var leader = FindLeader(ctx.Game);
+            // Draw leader marker if visible — reuse the entity Tick() already found this frame
+            // instead of repeating the same full entity-list search just for the overlay.
+            var leader = _lastKnownLeader;
             if (leader != null)
             {
                 var camera = ctx.Game.IngameState.Camera;

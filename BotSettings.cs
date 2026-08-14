@@ -1125,6 +1125,9 @@ namespace AutoExile
 
             [Menu("Max Watchdog Recoveries", "Stop the bot after this many consecutive watchdog recoveries without meaningful progress. 0 = never stop automatically.")]
             public RangeNode<int> MaxWatchdogRecoveries { get; set; } = new RangeNode<int>(3, 0, 10);
+
+            [Menu("Debug Recording", "Continuously records the last ~10s of tick-level state (decisions, threats, navigation) in memory, used by the F6 dump and by automatic diagnostics when navigation gets stuck or the watchdog fires. Disabling this saves a small amount of per-tick overhead but disables those diagnostic dumps — the watchdog's stuck-detection and auto-recovery keep working either way.")]
+            public ToggleNode DebugRecordingEnabled { get; set; } = new ToggleNode(true);
         }
 
         [Submenu(CollapsedByDefault = true)]

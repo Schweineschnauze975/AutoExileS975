@@ -716,26 +716,32 @@ namespace AutoExile
             _stash.ActionCooldownMs = Settings.Loot.StashItemCooldownMs.Value;
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
-            // Record tick state BEFORE early returns so recordings capture paused/loading/settle state
-            _recorder.RecordTick(GameController, _mode.Name,
-                (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
-                ?? (_mode as BlightMode)?.Phase.ToString()
-                ?? (_mode as SimulacrumMode)?.Phase.ToString()
-                ?? (_mode as HeistMode)?.Phase.ToString()
-                ?? (_mode as LabyrinthMode)?.Phase.ToString()
-                ?? (_mode as FollowerMode)?.State.ToString()
-                ?? (_mode as BossMode)?.Phase.ToString()
-                ?? "",
-                (_mode as Modes.WaveFarm.WaveFarmMode)?.Decision
-                ?? (_mode as SimulacrumMode)?.Decision
-                ?? (_mode as HeistMode)?.Decision
-                ?? (_mode as FollowerMode)?.Decision
-                ?? (_mode as BossMode)?.Decision
-                ?? "",
-                (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
-                ?? (_mode as BossMode)?.Status
-                ?? "",
-                _navigation, _interaction, _loot, _threat);
+            // Record tick state BEFORE early returns so recordings capture paused/loading/settle state.
+            // Gated by Settings.Run.DebugRecordingEnabled — this walks every nearby hostile entity
+            // each call, so skipping it when the user doesn't need F6/stuck/watchdog dumps saves
+            // real per-tick cost. ForceDump() (hotkey/watchdog) is a no-op when nothing was recorded.
+            if (Settings.Run.DebugRecordingEnabled.Value)
+            {
+                _recorder.RecordTick(GameController, _mode.Name,
+                    (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
+                    ?? (_mode as BlightMode)?.Phase.ToString()
+                    ?? (_mode as SimulacrumMode)?.Phase.ToString()
+                    ?? (_mode as HeistMode)?.Phase.ToString()
+                    ?? (_mode as LabyrinthMode)?.Phase.ToString()
+                    ?? (_mode as FollowerMode)?.State.ToString()
+                    ?? (_mode as BossMode)?.Phase.ToString()
+                    ?? "",
+                    (_mode as Modes.WaveFarm.WaveFarmMode)?.Decision
+                    ?? (_mode as SimulacrumMode)?.Decision
+                    ?? (_mode as HeistMode)?.Decision
+                    ?? (_mode as FollowerMode)?.Decision
+                    ?? (_mode as BossMode)?.Decision
+                    ?? "",
+                    (_mode as Modes.WaveFarm.WaveFarmMode)?.Status
+                    ?? (_mode as BossMode)?.Status
+                    ?? "",
+                    _navigation, _interaction, _loot, _threat);
+            }
 
             // Rising edge of Running (Insert hotkey or dashboard Start): restart one-shot modes so
             // they run again on Start instead of sitting idle after their first completed run.
@@ -1304,6 +1310,9 @@ namespace AutoExile
         private DateTime _lastTerrainRefresh = DateTime.MinValue;
         private const double TerrainRefreshIntervalSec = 3.0;
 
+        private DateTime _lastStatusSnapshotAt = DateTime.MinValue;
+        private const double StatusSnapshotIntervalMs = 500;
+
         private void TickWebServer()
         {
             if (_webServer == null || !_webServer.IsRunning) return;
@@ -1354,8 +1363,14 @@ namespace AutoExile
                 }
             }
 
-            // Build status snapshot for web UI — wrapped in try/catch so a single
-            // bad entity or stale pointer doesn't kill all dashboard updates.
+            // Build status snapshot for web UI — only as often as BroadcastLoop actually pushes it
+            // out (every 500ms, see BotWebServer.cs), since this rebuilds the full entity/nav-path
+            // list every time it runs and there's no point doing that more often than it's consumed.
+            // Wrapped in try/catch so a single bad entity or stale pointer doesn't kill dashboard updates.
+            if ((DateTime.Now - _lastStatusSnapshotAt).TotalMilliseconds < StatusSnapshotIntervalMs)
+                return;
+            _lastStatusSnapshotAt = DateTime.Now;
+
             try
             {
                 var phase = "";
@@ -1554,9 +1569,17 @@ namespace AutoExile
         // Exploration — area transition scanning
         // =================================================================
 
+        private DateTime _lastAreaTransitionScan = DateTime.MinValue;
+        private const int AreaTransitionScanIntervalMs = 250;
+
         private void ScanAreaTransitions()
         {
             if (!_exploration.IsInitialized) return;
+
+            // Transitions are static bookkeeping (exploration snapshot + debug dump only, see
+            // ExplorationMap.RecordTransition) — no consumer needs this faster than a quarter second.
+            if ((DateTime.Now - _lastAreaTransitionScan).TotalMilliseconds < AreaTransitionScanIntervalMs) return;
+            _lastAreaTransitionScan = DateTime.Now;
 
             foreach (var entity in GameController.EntityListWrapper.OnlyValidEntities)
             {
