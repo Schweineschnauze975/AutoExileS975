@@ -86,10 +86,24 @@ namespace AutoExile.WebServer
             int h = maxR - minR + 1;
             var data = new byte[w * h];
 
-            // Get exploration seen cells
-            HashSet<Vector2i>? seenCells = null;
+            // Explored-cell lookup: flatten SeenCells into a bool array over the cropped region
+            // ONCE, instead of calling HashSet<Vector2i>.Contains() per cell in the loop below.
+            // That per-cell hash lookup was the actual hot spot (measured ~310ms for this method
+            // even after the bounds scan was cached separately, see webserver.terrainBuild vs.
+            // webserver.terrainBounds on the Debug Perf Overlay) — it ran once per cell in the
+            // cropped region (potentially millions) rather than once per cell ever explored.
+            // SeenCells is normally far smaller than the region, so this trades ~SeenCells.Count
+            // hash lookups for millions of plain array reads.
+            bool[]? seen = null;
             if (exploration?.IsInitialized == true && exploration.ActiveBlob != null)
-                seenCells = exploration.ActiveBlob.SeenCells;
+            {
+                seen = new bool[w * h];
+                foreach (var cell in exploration.ActiveBlob.SeenCells)
+                {
+                    if (cell.X < minC || cell.X > maxC || cell.Y < minR || cell.Y > maxR) continue;
+                    seen[(cell.Y - minR) * w + (cell.X - minC)] = true;
+                }
+            }
 
             for (int r = minR; r <= maxR; r++)
             {
@@ -114,7 +128,7 @@ namespace AutoExile.WebServer
                         cellValue = 0; // wall
 
                     // Set explored bit (bit 3)
-                    if (seenCells != null && seenCells.Contains(new Vector2i(c, r)))
+                    if (seen != null && seen[idx])
                         cellValue |= 0x08;
 
                     data[idx] = cellValue;
