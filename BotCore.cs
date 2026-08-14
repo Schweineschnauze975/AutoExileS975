@@ -717,10 +717,10 @@ namespace AutoExile
             _stash.ApplyIncubators = Settings.AutoApplyIncubators.Value;
 
             // Record tick state BEFORE early returns so recordings capture paused/loading/settle state.
-            // Gated by Settings.Run.DebugRecordingEnabled — this walks every nearby hostile entity
+            // Gated by Settings.Run.DumpRecordingEnabled — this walks every nearby hostile entity
             // each call, so skipping it when the user doesn't need F6/stuck/watchdog dumps saves
             // real per-tick cost. ForceDump() (hotkey/watchdog) is a no-op when nothing was recorded.
-            if (Settings.Run.DebugRecordingEnabled.Value)
+            if (Settings.Run.DumpRecordingEnabled.Value)
             {
                 _recorder.RecordTick(GameController, _mode.Name,
                     (_mode as Modes.WaveFarm.WaveFarmMode)?.Status

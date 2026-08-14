@@ -208,8 +208,8 @@ namespace AutoExile.Systems
             if (string.IsNullOrEmpty(_outputDir)) return;
             if (_count == 0)
             {
-                // Nothing buffered — most likely Settings.Run.DebugRecordingEnabled is off.
-                _lastDumpStatus = "Nothing to dump (debug recording is disabled)";
+                // Nothing buffered — most likely Settings.Run.DumpRecordingEnabled is off.
+                _lastDumpStatus = "Nothing to dump (dump recording is disabled)";
                 return;
             }
             _lastDumpTime = DateTime.Now;
