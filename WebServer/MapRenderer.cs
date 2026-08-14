@@ -12,19 +12,35 @@ namespace AutoExile.WebServer
     public static class MapRenderer
     {
         /// <summary>
-        /// Encode terrain grid to a compact byte array (1 byte per cell).
-        /// Values: 0=wall, 1-5=walkable, 6=jumpable gap, +8 if explored (bit 3).
-        /// Cropped to walkable bounds.
+        /// Walkable-area bounds within a pathfinding grid, in grid-row/col space (already
+        /// padded). Cheap to reuse — the walkable area only changes when the area itself does.
         /// </summary>
-        public static MapTerrainData? BuildTerrainData(int[][]? pfGrid, int[][]? tgtGrid,
-            ExplorationMap? exploration)
+        public readonly struct TerrainBounds
         {
-            if (pfGrid == null || pfGrid.Length == 0) return null;
+            public readonly int MinR, MaxR, MinC, MaxC;
+            public TerrainBounds(int minR, int maxR, int minC, int maxC)
+            {
+                MinR = minR; MaxR = maxR; MinC = minC; MaxC = maxC;
+            }
+            public bool IsEmpty => MinR > MaxR;
+            public static readonly TerrainBounds Empty = new(1, 0, 1, 0);
+        }
+
+        /// <summary>
+        /// Scan the full pathfinding grid once to find the walkable bounds (padded by 5 cells).
+        /// This is the expensive part of terrain encoding (full-grid scan) — call only when the
+        /// area changes, then reuse the result for every periodic refresh via <see cref="BuildTerrainData"/>.
+        /// Measured ~325ms on a full grid scan every 3s before this was cached (see Perf overlay
+        /// "webserver.terrainBuild") — the walkable area doesn't change within an area, so scanning
+        /// it repeatedly bought nothing.
+        /// </summary>
+        public static TerrainBounds ComputeWalkableBounds(int[][]? pfGrid)
+        {
+            if (pfGrid == null || pfGrid.Length == 0) return TerrainBounds.Empty;
 
             int rows = pfGrid.Length;
             int cols = pfGrid[0].Length;
 
-            // Find walkable bounds (crop to relevant area)
             int minR = rows, maxR = 0, minC = cols, maxC = 0;
             for (int r = 0; r < rows; r++)
             {
@@ -42,7 +58,7 @@ namespace AutoExile.WebServer
                 }
             }
 
-            if (minR > maxR) return null; // No walkable cells
+            if (minR > maxR) return TerrainBounds.Empty; // No walkable cells
 
             // Add small padding
             minR = Math.Max(0, minR - 5);
@@ -50,6 +66,22 @@ namespace AutoExile.WebServer
             minC = Math.Max(0, minC - 5);
             maxC = Math.Min(cols - 1, maxC + 5);
 
+            return new TerrainBounds(minR, maxR, minC, maxC);
+        }
+
+        /// <summary>
+        /// Encode terrain grid to a compact byte array (1 byte per cell).
+        /// Values: 0=wall, 1-5=walkable, 6=jumpable gap, +8 if explored (bit 3).
+        /// Cropped to <paramref name="bounds"/> — compute once per area via
+        /// <see cref="ComputeWalkableBounds"/> and pass the same value in on every periodic refresh.
+        /// </summary>
+        public static MapTerrainData? BuildTerrainData(int[][]? pfGrid, int[][]? tgtGrid,
+            ExplorationMap? exploration, TerrainBounds bounds)
+        {
+            if (pfGrid == null || pfGrid.Length == 0) return null;
+            if (bounds.IsEmpty) return null;
+
+            int minR = bounds.MinR, maxR = bounds.MaxR, minC = bounds.MinC, maxC = bounds.MaxC;
             int w = maxC - minC + 1;
             int h = maxR - minR + 1;
             var data = new byte[w * h];

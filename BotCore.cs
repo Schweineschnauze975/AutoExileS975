@@ -1310,6 +1310,13 @@ namespace AutoExile
         private DateTime _lastTerrainRefresh = DateTime.MinValue;
         private const double TerrainRefreshIntervalSec = 3.0;
 
+        // Walkable bounds only change when the area does — cache them instead of re-scanning
+        // the full pathfinding grid on every refresh (measured ~325ms/call, see Perf overlay
+        // "webserver.terrainBuild" before this was added). -1 never matches a real area hash
+        // (including 0), so the first refresh always computes fresh.
+        private long _cachedTerrainBoundsHash = -1;
+        private MapRenderer.TerrainBounds _cachedTerrainBounds;
+
         private DateTime _lastStatusSnapshotAt = DateTime.MinValue;
         private const double StatusSnapshotIntervalMs = 500;
 
@@ -1334,9 +1341,20 @@ namespace AutoExile
                     tgtGrid = GameController.IngameState?.Data?.RawTerrainTargetingData;
                 }
 
+                // Recompute bounds only on area change (or if we never got real bounds for this
+                // area yet, e.g. grid wasn't ready on an earlier attempt) — everything else reuses
+                // the cached bounds, so terrainBuild below only does the cheap cropped encode.
+                if (currentHash != _cachedTerrainBoundsHash || _cachedTerrainBounds.IsEmpty)
+                {
+                    using (_ctx.Perf.SectionScope("webserver.terrainBounds"))
+                        _cachedTerrainBounds = MapRenderer.ComputeWalkableBounds(pfGrid);
+                    if (!_cachedTerrainBounds.IsEmpty)
+                        _cachedTerrainBoundsHash = currentHash;
+                }
+
                 MapTerrainData? terrain;
                 using (_ctx.Perf.SectionScope("webserver.terrainBuild"))
-                    terrain = MapRenderer.BuildTerrainData(pfGrid, tgtGrid, _exploration);
+                    terrain = MapRenderer.BuildTerrainData(pfGrid, tgtGrid, _exploration, _cachedTerrainBounds);
 
                 if (terrain != null)
                 {
