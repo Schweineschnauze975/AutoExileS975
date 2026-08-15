@@ -734,9 +734,15 @@ namespace AutoExile.Modes
                 var transition = ResolveTransitionEntity(gc);
                 if (transition != null)
                 {
-                    // Already navigated here — click directly, no redundant proximity nav
+                    // requireProximity: true (even though we already navigated here) so that if the
+                    // transition entity isn't on screen yet (camera hasn't caught up right after
+                    // arrival/area load), InteractionSystem's built-in off-screen recovery kicks in
+                    // immediately — it re-navigates a step closer, which turns the character toward
+                    // the entity — instead of us sitting idle for the full click timeout (previously
+                    // 5s flat) doing nothing while "Entity not on screen" is shown. We're already in
+                    // range, so this costs at most one extra tick in the common case.
                     ctx.Interaction.InteractWithEntity(transition, ctx.Navigation,
-                        requireProximity: false);
+                        requireProximity: true);
                     _state = FollowerState.ClickingTransition;
                     _status = "Arrived — clicking portal/transition";
                     _decision = "click_transition";
