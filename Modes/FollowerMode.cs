@@ -1018,7 +1018,7 @@ namespace AutoExile.Modes
                     continue;
 
                 if (entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
-                    || IsLeagueMechanicPortal(entity))
+                    || IsNonStandardPortal(entity))
                 {
                     result.Add(entity);
                 }
@@ -1051,7 +1051,7 @@ namespace AutoExile.Modes
                     continue;
 
                 var isPortal = entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
-                    || IsLeagueMechanicPortal(entity);
+                    || IsNonStandardPortal(entity);
                 var isTransition = entity.Type == EntityType.AreaTransition;
 
                 if (isPortal && !includePortals) continue;
@@ -1071,17 +1071,36 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
-        /// Detect league mechanic portals that use non-standard EntityTypes (e.g., Effect, MiscellaneousObjects)
-        /// instead of Portal/TownPortal/AreaTransition.
+        /// Detect portal-like entities that use non-standard EntityTypes (e.g., Effect, None, IngameIcon)
+        /// instead of Portal/TownPortal, so they still count as "portal" for follow-through-transition
+        /// purposes. Identified via DevTree inspection of entities that FindNearestEntity/FindAllPortals
+        /// were silently skipping — see PoE data dump for exact Path/Type combos.
         /// </summary>
-        private static bool IsLeagueMechanicPortal(Entity entity)
+        private static bool IsNonStandardPortal(Entity entity)
         {
             var path = entity.Path;
             if (string.IsNullOrEmpty(path)) return false;
 
-            return path.Contains("SekhemaPortal")            // Faridun wishes return portal (type: Effect)
-                || path.Contains("Faridun/DjinnPortal")      // Faridun wishes entry portal
-                || path.Contains("HarvestPortalToggleable"); // Harvest portals (entrance + return)
+            if (path.Contains("SekhemaPortal")) return true;                 // Faridun wishes return portal (type: Effect)
+            if (path.Contains("Faridun/DjinnPortal")) return true;           // Faridun wishes entry portal
+            if (path.Contains("HarvestPortalToggleable")) return true;       // Harvest portals (entrance + return)
+
+            // Cosmetically skinned town portals render as an Effect instead of TownPortal — this covers
+            // every portal MTX skin (e.g. .../Town_Portals/ArbiterOfDivinity/...), not just specific ones,
+            // since new skins are added to the game regularly and we don't want to chase each one.
+            if (path.Contains("Effects/Microtransactions/Town_Portals/")) return true;
+
+            // Awakener fight: the 6 "Templar Laboratory" arena-entry portals (type: None). Path looks like
+            // Metadata/Monsters/AtlasExiles/ArenaMechanics/AtlasExile5Portal1..6 — also require "Portal" in
+            // the path so we don't pick up the sibling AtlasExile5MapDeviceOrion entity in the same area.
+            if (path.Contains("ArenaMechanics/AtlasExile") && path.Contains("Portal")) return true;
+
+            // Boss "return to town" portals after an epilogue/arena fight (type: IngameIcon), e.g.
+            // Metadata/NPC/Epilogue/ZanaOrionPostFightPortal. Matched broadly since other encounters
+            // likely have similarly named epilogue return portals.
+            if (path.Contains("NPC/Epilogue") && path.Contains("Portal")) return true;
+
+            return false;
         }
 
         private static Vector2 GetPlayerGrid(GameController gc)
