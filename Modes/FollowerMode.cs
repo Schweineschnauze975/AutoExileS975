@@ -43,6 +43,13 @@ namespace AutoExile.Modes
         private bool _hasLastLeaderPos;
         private string _lastAreaName = "";
 
+        // Leader entity found this Tick() — reused by Render() for the leader marker so the
+        // same full entity-list search isn't repeated a second time within the same frame.
+        // Only refreshed when Tick() actually reaches the FindLeader() call below (not during
+        // loading screens / in-progress transition clicks, where an extra frame of staleness
+        // on a purely cosmetic marker doesn't matter).
+        private Entity? _lastKnownLeader;
+
         // Leader velocity tracking — smoothed over several ticks for prediction
         private Vector2 _leaderVelocity; // grid units per second
         private DateTime _lastLeaderSampleTime = DateTime.MinValue;
@@ -224,6 +231,7 @@ namespace AutoExile.Modes
 
             // Try to find the leader entity
             var leader = FindLeader(gc);
+            _lastKnownLeader = leader;
 
             if (leader != null)
             {
@@ -726,9 +734,15 @@ namespace AutoExile.Modes
                 var transition = ResolveTransitionEntity(gc);
                 if (transition != null)
                 {
-                    // Already navigated here — click directly, no redundant proximity nav
+                    // requireProximity: true (even though we already navigated here) so that if the
+                    // transition entity isn't on screen yet (camera hasn't caught up right after
+                    // arrival/area load), InteractionSystem's built-in off-screen recovery kicks in
+                    // immediately — it re-navigates a step closer, which turns the character toward
+                    // the entity — instead of us sitting idle for the full click timeout (previously
+                    // 5s flat) doing nothing while "Entity not on screen" is shown. We're already in
+                    // range, so this costs at most one extra tick in the common case.
                     ctx.Interaction.InteractWithEntity(transition, ctx.Navigation,
-                        requireProximity: false);
+                        requireProximity: true);
                     _state = FollowerState.ClickingTransition;
                     _status = "Arrived — clicking portal/transition";
                     _decision = "click_transition";
@@ -1010,7 +1024,7 @@ namespace AutoExile.Modes
                     continue;
 
                 if (entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
-                    || IsLeagueMechanicPortal(entity))
+                    || IsNonStandardPortal(entity))
                 {
                     result.Add(entity);
                 }
@@ -1043,7 +1057,7 @@ namespace AutoExile.Modes
                     continue;
 
                 var isPortal = entity.Type == EntityType.TownPortal || entity.Type == EntityType.Portal
-                    || IsLeagueMechanicPortal(entity);
+                    || IsNonStandardPortal(entity);
                 var isTransition = entity.Type == EntityType.AreaTransition;
 
                 if (isPortal && !includePortals) continue;
@@ -1063,17 +1077,36 @@ namespace AutoExile.Modes
         }
 
         /// <summary>
-        /// Detect league mechanic portals that use non-standard EntityTypes (e.g., Effect, MiscellaneousObjects)
-        /// instead of Portal/TownPortal/AreaTransition.
+        /// Detect portal-like entities that use non-standard EntityTypes (e.g., Effect, None, IngameIcon)
+        /// instead of Portal/TownPortal, so they still count as "portal" for follow-through-transition
+        /// purposes. Identified via DevTree inspection of entities that FindNearestEntity/FindAllPortals
+        /// were silently skipping — see PoE data dump for exact Path/Type combos.
         /// </summary>
-        private static bool IsLeagueMechanicPortal(Entity entity)
+        private static bool IsNonStandardPortal(Entity entity)
         {
             var path = entity.Path;
             if (string.IsNullOrEmpty(path)) return false;
 
-            return path.Contains("SekhemaPortal")            // Faridun wishes return portal (type: Effect)
-                || path.Contains("Faridun/DjinnPortal")      // Faridun wishes entry portal
-                || path.Contains("HarvestPortalToggleable"); // Harvest portals (entrance + return)
+            if (path.Contains("SekhemaPortal")) return true;                 // Faridun wishes return portal (type: Effect)
+            if (path.Contains("Faridun/DjinnPortal")) return true;           // Faridun wishes entry portal
+            if (path.Contains("HarvestPortalToggleable")) return true;       // Harvest portals (entrance + return)
+
+            // Cosmetically skinned town portals render as an Effect instead of TownPortal — this covers
+            // every portal MTX skin (e.g. .../Town_Portals/ArbiterOfDivinity/...), not just specific ones,
+            // since new skins are added to the game regularly and we don't want to chase each one.
+            if (path.Contains("Effects/Microtransactions/Town_Portals/")) return true;
+
+            // Awakener fight: the 6 "Templar Laboratory" arena-entry portals (type: None). Path looks like
+            // Metadata/Monsters/AtlasExiles/ArenaMechanics/AtlasExile5Portal1..6 — also require "Portal" in
+            // the path so we don't pick up the sibling AtlasExile5MapDeviceOrion entity in the same area.
+            if (path.Contains("ArenaMechanics/AtlasExile") && path.Contains("Portal")) return true;
+
+            // Boss "return to town" portals after an epilogue/arena fight (type: IngameIcon), e.g.
+            // Metadata/NPC/Epilogue/ZanaOrionPostFightPortal. Matched broadly since other encounters
+            // likely have similarly named epilogue return portals.
+            if (path.Contains("NPC/Epilogue") && path.Contains("Portal")) return true;
+
+            return false;
         }
 
         private static Vector2 GetPlayerGrid(GameController gc)
@@ -1127,8 +1160,9 @@ namespace AutoExile.Modes
                 hudY += lineH;
             }
 
-            // Draw leader marker if visible
-            var leader = FindLeader(ctx.Game);
+            // Draw leader marker if visible — reuse the entity Tick() already found this frame
+            // instead of repeating the same full entity-list search just for the overlay.
+            var leader = _lastKnownLeader;
             if (leader != null)
             {
                 var camera = ctx.Game.IngameState.Camera;
@@ -1161,6 +1195,45 @@ namespace AutoExile.Modes
                         var lineColor = path[i + 1].Action == WaypointAction.Blink
                             ? SharpDX.Color.Magenta : SharpDX.Color.Yellow;
                         gfx.DrawLine(new Vector2(sa.X, sa.Y), new Vector2(sb.X, sb.Y), 2, lineColor);
+                    }
+                }
+            }
+
+            // Performance overlay (opt-in — off by default). Same panel as WaveFarmMode's; ctx.Perf
+            // is a single tracker shared across the whole plugin, so sections recorded anywhere
+            // (e.g. BotCore's webserver.terrainFetch/terrainBuild) show up here too — this just
+            // makes the panel visible while Follower is the active mode instead of only Wave Farm.
+            if (ctx.Settings.DebugPerfOverlay.Value)
+            {
+                var dim = new SharpDX.Color(180, 180, 180, 255);
+                var bright = SharpDX.Color.White;
+                var warn = SharpDX.Color.Yellow;
+                var bad = SharpDX.Color.OrangeRed;
+
+                hudY += lineH / 2;
+                gfx.DrawText("── Perf (ms) avg / p95 / max ──", new Vector2(hudX, hudY), bright);
+                hudY += lineH;
+                foreach (var (name, st) in ctx.Perf.TopSections(8))
+                {
+                    var c = st.MaxMs > 20 ? bad : st.MaxMs > 8 ? warn : dim;
+                    gfx.DrawText($"  {name,-26} {st.AvgMs,5:F2} / {st.P95Ms,5:F2} / {st.MaxMs,5:F2}  (n={st.Count})",
+                        new Vector2(hudX, hudY), c);
+                    hudY += lineH;
+                }
+
+                var lootSkipTotal = ctx.Perf.FailureTotal("lootSkip");
+                var lootTotal = ctx.Perf.FailureTotal("loot");
+                var interactTotal = ctx.Perf.FailureTotal("interact");
+                var exploreTotal = ctx.Perf.FailureTotal("explore");
+                gfx.DrawText($"── Failures — lootSkip:{lootSkipTotal}  lootClick:{lootTotal}  interact:{interactTotal}  explore:{exploreTotal} ──",
+                    new Vector2(hudX, hudY), bright);
+                hudY += lineH;
+                foreach (var cat in new[] { "loot", "interact", "lootSkip", "explore" })
+                {
+                    foreach (var (reason, count) in ctx.Perf.TopFailures(cat, 3))
+                    {
+                        gfx.DrawText($"  [{cat}] {reason}: {count}", new Vector2(hudX, hudY), warn);
+                        hudY += lineH;
                     }
                 }
             }

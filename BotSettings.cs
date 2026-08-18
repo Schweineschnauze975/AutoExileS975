@@ -21,11 +21,8 @@ namespace AutoExile
         [Menu("Test Map Explore", "Hotkey to start/restart map exploration test (navigate to beacon, fight, explore 70%).")]
         public HotkeyNode TestMapExplore { get; set; } = new HotkeyNode(Keys.F5);
 
-        [Menu("Dump Game State", "Hotkey to dump terrain, exploration, and pathfinding data to image + JSON files.")]
+        [Menu("Dump Game State", "Hotkey to dump terrain, exploration, and pathfinding data to image + JSON files. Also dumps the last ~10s of tick-level state (decisions, threats, navigation, actions) if recording is enabled.")]
         public HotkeyNode DumpGameState { get; set; } = new HotkeyNode(Keys.F6);
-
-        [Menu("Dump Recording", "Hotkey to dump last ~10 seconds of tick-level state (decisions, threats, navigation, actions).")]
-        public HotkeyNode DumpRecording { get; set; } = new HotkeyNode(Keys.F7);
 
         [Menu("Scan Tile Signatures", "Hotkey to scan nearby tiles for unique/rare map signatures and overlay results.")]
         public HotkeyNode ScanTileSignatures { get; set; } = new HotkeyNode(Keys.F8);
@@ -1125,6 +1122,9 @@ namespace AutoExile
 
             [Menu("Max Watchdog Recoveries", "Stop the bot after this many consecutive watchdog recoveries without meaningful progress. 0 = never stop automatically.")]
             public RangeNode<int> MaxWatchdogRecoveries { get; set; } = new RangeNode<int>(3, 0, 10);
+
+            [Menu("Dump Recording Enabled", "Continuously records the last ~10s of tick-level state (decisions, threats, navigation) in memory, used by the F6 dump and by automatic diagnostics when navigation gets stuck or the watchdog fires. Disabling this saves a small amount of per-tick overhead but disables those diagnostic dumps — the watchdog's stuck-detection and auto-recovery keep working either way.")]
+            public ToggleNode DumpRecordingEnabled { get; set; } = new ToggleNode(true);
         }
 
         [Submenu(CollapsedByDefault = true)]

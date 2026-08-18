@@ -205,7 +205,13 @@ namespace AutoExile.Systems
 
         private void DumpToFile(string reason)
         {
-            if (string.IsNullOrEmpty(_outputDir) || _count == 0) return;
+            if (string.IsNullOrEmpty(_outputDir)) return;
+            if (_count == 0)
+            {
+                // Nothing buffered — most likely Settings.Run.DumpRecordingEnabled is off.
+                _lastDumpStatus = "Nothing to dump (dump recording is disabled)";
+                return;
+            }
             _lastDumpTime = DateTime.Now;
 
             try

@@ -1495,13 +1495,13 @@ function renderAllSettings() {
 
   // Advanced tab
   const adv = makeTabContent('advanced', activeSettingsTab === 'advanced');
-  addSection(adv, 'Run Control', [['run.maxDeaths'],['run.stashItemThreshold'],['run.lootSweepTimeoutSeconds'],['run.portalKey'],['run.maxRuntimeMinutes'],['run.finishAndStop'],['run.hideoutWaitTimeoutMinutes'],['run.globalWatchdogEnabled'],['run.globalWatchdogTimeoutMinutes'],['run.maxWatchdogRecoveries']]);
+  addSection(adv, 'Run Control', [['run.maxDeaths'],['run.stashItemThreshold'],['run.lootSweepTimeoutSeconds'],['run.portalKey'],['run.maxRuntimeMinutes'],['run.finishAndStop'],['run.hideoutWaitTimeoutMinutes'],['run.globalWatchdogEnabled'],['run.globalWatchdogTimeoutMinutes'],['run.maxWatchdogRecoveries'],['run.dumpRecordingEnabled']]);
   addSection(adv, 'General', [['actionCooldownMs'],['extraLatencyMs'],['maxClickAttempts'],['interactRadius'],['areaSettleSeconds'],['autoLevelGems'],['autoApplyIncubators'],['debugIncubatorOverlay']]);
   addSection(adv, 'Threat Detection', [['threat.enabled'],['threat.monitorRares'],['threat.autoDodge'],
     ['threat.threatRadius'],['threat.dodgeTriggerDistance'],['threat.dodgeDistance'],
     ['threat.dodgeMinProgress'],['threat.dodgeMaxProgress'],['threat.dodgeCooldownMs']]);
   addSection(adv, 'Web UI', [['webUiEnabled'],['webUiPort']]);
-  addSection(adv, 'Hotkeys', [['toggleRunning'],['finishAndStopHotkey'],['testMapExplore'],['dumpGameState'],['dumpRecording']]);
+  addSection(adv, 'Hotkeys', [['toggleRunning'],['finishAndStopHotkey'],['testMapExplore'],['dumpGameState'],['recordGameplay']]);
   c.appendChild(adv);
 
   switchSettingsTab(activeSettingsTab);
