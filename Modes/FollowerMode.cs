@@ -75,6 +75,13 @@ namespace AutoExile.Modes
         private DateTime _lastPartyTeleportAttempt = DateTime.MinValue;
         private const float PartyTeleportRetrySeconds = 2.0f; // don't spam the button
 
+        // Chart portals (e.g. "The Sovereign"'s Bathysphere) must always be preferred over the
+        // adjacent stairs while open, regardless of distance — see the priority check at the top
+        // of TryFollowLeaderExit(). This cooldown just stops a failed click from being retried
+        // every single tick — see IsChartPortal below.
+        private DateTime _lastChartPortalFailure = DateTime.MinValue;
+        private const float ChartPortalRetryCooldownMs = 8000f;
+
         // Loot tracking — only record on confirmed pickup
         private DateTime _lastLootScan = DateTime.MinValue;
         private const float LootScanIntervalMs = 500;
@@ -216,6 +223,13 @@ namespace AutoExile.Modes
                 else if (interactionResult == InteractionResult.Failed)
                 {
                     ctx.Log("Transition click failed — searching for leader");
+                    // If the click that just failed was on a chart portal, remember it briefly
+                    // (ChartPortalRetryCooldownMs) so TryFollowLeaderExit() doesn't immediately
+                    // re-select it every tick and get stuck — falls back to a normal exit (e.g.
+                    // the stairs) for a bit instead. Resolve BEFORE clearing _transitionEntityId.
+                    var failedTransition = ResolveTransitionEntity(gc);
+                    if (failedTransition != null && IsChartPortal(failedTransition))
+                        _lastChartPortalFailure = DateTime.Now;
                     _state = FollowerState.SearchingForLeader;
                     _transitionGridPos = null;
                     _transitionEntityId = 0;
@@ -741,8 +755,19 @@ namespace AutoExile.Modes
                     // the entity — instead of us sitting idle for the full click timeout (previously
                     // 5s flat) doing nothing while "Entity not on screen" is shown. We're already in
                     // range, so this costs at most one extra tick in the common case.
+                    //
+                    // EXCEPTION: chart portals (e.g. the Bathysphere). Confirmed via log — the
+                    // follower reached the nav target and then still timed out after ~10s with 0
+                    // click attempts. Cause: InteractionSystem's Navigating phase only switches to
+                    // Clicking once within InteractRadius (20 grid units default); for a large
+                    // Terrain object standing partly over water/unwalkable ground, the closest
+                    // reachable tile can be further than that, so it just kept re-pathing toward a
+                    // spot it could never get closer to until the timeout fired — never actually
+                    // clicking. We already navigated here via StartNavigationToEntity, so we're as
+                    // close as pathfinding will ever get us; requireProximity: false skips the
+                    // distance gate and clicks directly instead.
                     ctx.Interaction.InteractWithEntity(transition, ctx.Navigation,
-                        requireProximity: true);
+                        requireProximity: !IsChartPortal(transition));
                     _state = FollowerState.ClickingTransition;
                     _status = "Arrived — clicking portal/transition";
                     _decision = "click_transition";
@@ -765,11 +790,31 @@ namespace AutoExile.Modes
 
         /// <summary>
         /// Try to find and navigate to whatever exit the leader used.
-        /// Priority: town portals (always) > area transitions (if FollowThroughTransitions enabled).
+        /// Priority: open chart portals (always, e.g. "The Sovereign"'s Bathysphere) > town portals
+        /// (always) > area transitions (if FollowThroughTransitions enabled).
         /// Town portals are the primary party travel mechanism and should always be followed.
         /// </summary>
         private bool TryFollowLeaderExit(BotContext ctx, GameController gc, Vector2 nearGridPos)
         {
+            // Chart portals (e.g. Bathysphere) get absolute priority over everything else when
+            // open — if the leader vanished while one was open nearby, that's almost certainly
+            // how they left, and it should win over an unrelated closer staircase etc., not just
+            // when it happens to be closer. Skip this for a while after a failed attempt
+            // (ChartPortalRetryCooldownMs) so a bad click doesn't retry forever — falls through to
+            // the normal portal/transition search below instead (e.g. the stairs) during the
+            // cooldown.
+            if (FollowThroughTransitions
+                && (DateTime.Now - _lastChartPortalFailure).TotalMilliseconds >= ChartPortalRetryCooldownMs)
+            {
+                var chartPortal = FindNearestChartPortal(gc, nearGridPos, openOnly: true);
+                if (chartPortal != null)
+                {
+                    ctx.Log($"Open chart portal found near ({nearGridPos.X:F0},{nearGridPos.Y:F0}) — following through it");
+                    if (StartNavigationToEntity(ctx, gc, chartPortal))
+                        return true;
+                }
+            }
+
             // First: look for town portals / portals (always followed)
             var portal = FindNearestEntity(gc, nearGridPos, includePortals: true, includeTransitions: false);
 
@@ -820,11 +865,11 @@ namespace AutoExile.Modes
             ctx.Navigation.NavigateTo(gc, transGridPos, maxNodes: 200000);
 
             var isPortal = target.Type == EntityType.TownPortal || target.Type == EntityType.Portal;
-            _status = isPortal
-                ? "Leader gone — heading to portal"
-                : "Leader gone — heading to area transition";
-            _decision = isPortal ? "follow_portal" : "follow_transition";
-            ctx.Log($"Following leader through {(isPortal ? "portal" : "transition")} (dist: {distFromPlayer:F0})");
+            var isChartPortal = IsChartPortal(target);
+            var kind = isChartPortal ? "chart portal" : isPortal ? "portal" : "transition";
+            _status = $"Leader gone — heading to {kind}";
+            _decision = isChartPortal ? "follow_chart_portal" : isPortal ? "follow_portal" : "follow_transition";
+            ctx.Log($"Following leader through {kind} (dist: {distFromPlayer:F0})");
             return true;
         }
 
@@ -1107,6 +1152,79 @@ namespace AutoExile.Modes
             if (path.Contains("NPC/Epilogue") && path.Contains("Portal")) return true;
 
             return false;
+        }
+
+        /// <summary>
+        /// Detect "chart portal" entities — e.g. "The Sovereign"'s Bathysphere, which opens a
+        /// sub-area once a chart is inserted via its own UI. Path confirmed via DevTree:
+        /// Metadata/Terrain/Leagues/Deepwater/Objects/ChartPortal (Type: Terrain,
+        /// RenderName: "Bathysphere"). Confirmed via DevTree + decompiled Entity.cs that this is
+        /// the actually-clickable object, not the map-icon marker at
+        /// .../Doodads/Leagues/Deepwater/ChartPortalLocator (Type: IngameIcon, always
+        /// IsTargetable == false and not otherwise usable — an earlier version of this check
+        /// targeted that entity by mistake, which is why it didn't work in testing).
+        /// This entity IS IsTargetable in both its open and closed state, so — unlike the
+        /// Locator — it doesn't need any special IsTargetable bypass.
+        /// </summary>
+        private static bool IsChartPortal(Entity entity)
+        {
+            var path = entity.Path;
+            return !string.IsNullOrEmpty(path) && path.Contains("Objects/ChartPortal");
+        }
+
+        /// <summary>
+        /// Whether a chart portal currently has a chart inserted (destination area open) vs. is
+        /// still waiting for one. Confirmed via DevTree: the entity's StateMachine component
+        /// (component + `States` property confirmed real via decompiled StateMachine.cs) exposes
+        /// a state entry with Name "ready" whose Value is 1 when open and 0 when closed —
+        /// screenshots of both states showed only this differ, everything else on the entity is
+        /// identical. One caveat: `StateMachineState.Name`/`.Value` themselves were read off
+        /// DevTree's reflection/Properties panel, not decompiled directly (only StateMachine's own
+        /// `States` property was decompiled) — this pattern has held up before in this file, but
+        /// if this doesn't compile or doesn't behave as expected, tell me and we'll get
+        /// StateMachineState decompiled directly too.
+        /// (Earlier attempts tried `!entity.IsDead` and the DevTree-only `PluginData` field on the
+        /// wrong entity — both wrong, see git history / project notes.)
+        /// </summary>
+        private static bool IsChartPortalOpen(Entity entity)
+        {
+            if (!entity.TryGetComponent<StateMachine>(out var stateMachine) || stateMachine?.States == null)
+                return false;
+
+            foreach (var state in stateMachine.States)
+            {
+                if (state.Name == "ready")
+                    return state.Value != 0;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Returns the nearest chart portal, optionally restricted to ones that are currently open.
+        /// </summary>
+        private Entity? FindNearestChartPortal(GameController gc, Vector2 nearGridPos, bool openOnly)
+        {
+            Entity? best = null;
+            float bestDist = float.MaxValue;
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (!IsChartPortal(entity))
+                    continue;
+                if (openOnly && !IsChartPortalOpen(entity))
+                    continue;
+
+                var entityGridPos = new Vector2(entity.GridPosNum.X, entity.GridPosNum.Y);
+                var dist = Vector2.Distance(nearGridPos, entityGridPos);
+                if (dist < bestDist)
+                {
+                    bestDist = dist;
+                    best = entity;
+                }
+            }
+
+            return best;
         }
 
         private static Vector2 GetPlayerGrid(GameController gc)

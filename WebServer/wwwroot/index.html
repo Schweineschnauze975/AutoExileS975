@@ -1300,7 +1300,9 @@ function renderModeTab(container, modeName) {
       addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fallbackDumpTabName'],['stash.mappingSuppliesTabName']]);
     } else if (section === 'simulacrum') {
       addSection(container, 'Simulacrum', [['simulacrum.simulacrumStock'],
-        ['simulacrum.minWaveDelaySeconds'],['simulacrum.waveTimeoutMinutes']]);
+        ['simulacrum.minWaveDelaySeconds'],['simulacrum.waveTimeoutMinutes'],
+        ['simulacrum.waitForFollower'],
+        {key:'simulacrum.followerNames', showIf:'simulacrum.waitForFollower'}]);
       addSection(container, 'Run (shared)', [['run.maxDeaths'],['run.stashItemThreshold'],
         ['run.lootSweepTimeoutSeconds'],['run.portalKey']]);
       addSection(container, 'Stash (shared)', [['stash.dumpTabName'],['stash.fallbackDumpTabName'],['stash.fragmentTabName']]);
