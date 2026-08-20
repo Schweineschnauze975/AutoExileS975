@@ -520,6 +520,12 @@ namespace AutoExile
 
             [Menu("Simulacrum Stock", "Keep this many full Simulacrums in inventory. Withdraws from the central Fragment tab (Stash settings) to maintain stock between runs.")]
             public RangeNode<int> SimulacrumStock { get; set; } = new RangeNode<int>(5, 1, 20);
+
+            [Menu("Wait For Follower", "Wait until a living follower character is in the area before moving to the monolith, and before activating the monolith for each wave. For builds that don't work without their follower.")]
+            public ToggleNode WaitForFollower { get; set; } = new ToggleNode(false);
+
+            [Menu("Follower Name(s)", "Character name(s) of the follower, comma-separated — any one of them being present is enough. Leave empty to accept any other living player in the area.")]
+            public TextNode FollowerNames { get; set; } = new TextNode("");
         }
 
         [Submenu(CollapsedByDefault = true)]

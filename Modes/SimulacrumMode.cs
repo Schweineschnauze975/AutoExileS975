@@ -83,6 +83,11 @@ namespace AutoExile.Modes
         private const float CloseUniqueCombatLockDistance = 22f;
         private const float CloseUniquePenaltyResetSeconds = 1.5f;
 
+        // Follower presence gate (Settings.Simulacrum.WaitForFollower) — cached split of the
+        // comma-separated name setting so we don't allocate a string[] on every check.
+        private string _followerNamesRaw = "";
+        private string[] _followerNames = Array.Empty<string>();
+
         // Action cooldown
         private const float MajorActionCooldownMs = 500f;
 
@@ -384,8 +389,75 @@ namespace AutoExile.Modes
         // Map phases
         // =================================================================
 
+        /// <summary>
+        /// Follower gate for Settings.Simulacrum.WaitForFollower. Returns true when the check
+        /// is off, or when at least one living player entity other than ourselves is in the
+        /// area and matches the configured name list. An empty name list accepts any other
+        /// living player. Detection mirrors FollowerMode.FindLeader (EntityType.Player +
+        /// Player.PlayerName); a dead follower deliberately does NOT count.
+        /// Perf: one pass over OnlyValidEntities, but only on the few ticks where the mode is
+        /// about to move to / activate the monolith — not on every tick.
+        /// </summary>
+        private bool IsFollowerPresent(BotContext ctx)
+        {
+            if (!_settings.WaitForFollower.Value) return true;
+
+            var gc = ctx.Game;
+            if (gc?.Player == null) return true;
+
+            // Re-split the comma-separated list only when the setting text actually changed.
+            var raw = _settings.FollowerNames.Value ?? "";
+            if (!string.Equals(raw, _followerNamesRaw, StringComparison.Ordinal))
+            {
+                _followerNamesRaw = raw;
+                _followerNames = raw.Split(',',
+                    StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            }
+
+            foreach (var entity in gc.EntityListWrapper.OnlyValidEntities)
+            {
+                if (entity.Type != EntityType.Player) continue;
+                if (entity.Id == gc.Player.Id) continue; // that's us
+                if (!entity.IsAlive) continue;           // a dead follower is no help
+
+                if (_followerNames.Length == 0) return true;
+
+                var name = entity.GetComponent<Player>()?.PlayerName;
+                if (string.IsNullOrEmpty(name)) continue;
+
+                foreach (var candidate in _followerNames)
+                {
+                    if (string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
         private void TickFindMonolith(BotContext ctx)
         {
+            var gc = ctx.Game;
+            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
+
+            // Follower gate — don't start moving through the map until the follower has
+            // loaded in. _phaseStartTime keeps running on purpose, so the existing
+            // FindMonolith timeout below still ends the run if the follower never shows up.
+            if (!IsFollowerPresent(ctx))
+            {
+                if (ctx.Navigation.IsNavigating)
+                    ctx.Navigation.Stop(gc);
+
+                StatusText = "Waiting for follower to enter the area...";
+
+                if (elapsed > _settings.WaveTimeoutMinutes.Value * 60)
+                {
+                    StatusText = "Follower never arrived — timeout";
+                    _phase = SimPhase.Done;
+                }
+                return;
+            }
+
             if (_state.MonolithPosition.HasValue)
             {
                 _phase = SimPhase.NavigateToMonolith;
@@ -393,9 +465,6 @@ namespace AutoExile.Modes
                 StatusText = "Monolith found — navigating";
                 return;
             }
-
-            var gc = ctx.Game;
-            var elapsed = (DateTime.Now - _phaseStartTime).TotalSeconds;
 
             // Wait for entity list to settle after zone load
             if (elapsed < ctx.Settings.AreaSettleSeconds.Value)
@@ -782,6 +851,18 @@ namespace AutoExile.Modes
 
             if (DateTime.Now >= _state.CanStartWaveAt && _state.CurrentWave < 15)
             {
+                // Follower gate — never activate the monolith without the follower.
+                // Sits AFTER the between-wave timeout tracking above on purpose, so a follower
+                // that never comes back still ends the run via BetweenWaveTimeoutSeconds.
+                if (!IsFollowerPresent(ctx))
+                {
+                    var abortIn = BetweenWaveTimeoutSeconds - betweenWaveElapsed;
+                    Decision = "Waiting for follower before starting next wave";
+                    IdleNearMonolith(ctx);
+                    StatusText = $"Wave {_state.CurrentWave}/15 — waiting for follower ({abortIn:F0}s until abort)";
+                    return;
+                }
+
                 Decision = $"Wave {_state.CurrentWave}/15 → StartWave (attempt {_waveStartAttempts}/{MaxWaveStartAttempts})";
                 TickStartWave(ctx);
                 return;
